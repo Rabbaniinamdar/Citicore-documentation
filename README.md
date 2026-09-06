@@ -1658,16 +1658,8 @@ The architecture's core flow is therefore:
 **Client → ALB → API Gateway → Microservice → Database / Redis / Kafka → Response or Event Consumers.**
 
 ---
-
-## TOPIC 3 — MICROSERVICES
-
-**Current Topic:** 3 — Microservices
-**Previous Topics Completed:** 1 — Project Overview, 2 — Complete System Architecture
-**Remaining Topics:** 4 — Service Discovery onward
-
----
-
-# 3.1 Microservices Overview
+## TOPIC 3 - MICROSERVICES
+## 3.1 Microservices Overview
 
 ## What is it?
 
@@ -11371,4 +11363,18703 @@ Retry + DLT
 Saga + Reversal
 → Distributed transaction compensation
 ```
+---
+# TOPIC 8 — REDIS
 
+## 8.1 What is Redis?
+
+### Concept
+
+**Redis** is an in-memory data store. Unlike a traditional relational database such as MySQL, Redis primarily stores data in memory, which makes it useful for low-latency operations.
+
+Redis supports different data structures, including:
+
+* Strings
+* Hashes
+* Lists
+* Sets
+* Sorted sets
+
+In CitiCore, Redis is used primarily for two purposes:
+
+```text
+1. Caching
+2. API Gateway rate limiting
+```
+
+The caching implementation documented in the CitiCore notes focuses on reducing database reads for frequently requested account balance data. Redis is also referenced by the API Gateway as the backing store for rate-limiting functionality. 
+
+---
+
+## 8.2 Why Do We Need Redis?
+
+### Problem
+
+Without caching, every balance request may reach the database.
+
+```text
+Client
+   |
+   v
+Account Service
+   |
+   v
+MySQL / RDS
+```
+
+For frequently requested data, this can create unnecessary database load.
+
+For example:
+
+```text
+100 requests
+     |
+     v
+100 database reads
+```
+
+If the data can safely be cached:
+
+```text
+100 requests
+     |
+     v
+Redis
+     |
+     +---- Most requests served from cache
+     |
+     +---- Database used on cache miss
+```
+
+Redis can therefore help:
+
+* Reduce database read load
+* Reduce latency for repeated reads
+* Improve application responsiveness
+* Support centralized distributed rate limiting
+
+However, caching introduces an important problem:
+
+```text
+Cached data
+     |
+     v
+Can become stale
+```
+
+Therefore, Redis is not simply added for speed. A caching strategy must define:
+
+* What data should be cached
+* Cache key structure
+* TTL
+* Cache invalidation behavior
+* What happens when data changes
+* What happens when Redis is unavailable
+
+---
+
+# 8.3 CitiCore Context
+
+## CitiCore Implementation
+
+The CitiCore notes document Redis integration primarily in the **Account Service** for caching account balances.
+
+The documented flow is:
+
+```text
+GET Balance
+    |
+    v
+Check Redis
+    |
+    +---- Cache HIT
+    |        |
+    |        v
+    |   Return cached balance
+    |
+    +---- Cache MISS
+             |
+             v
+        Query database
+             |
+             v
+        Store in Redis
+             |
+             v
+        Return balance
+```
+
+The implementation uses:
+
+```text
+Cache key prefix:
+balance:
+
+Example:
+balance:<accountNumber>
+
+TTL:
+30 minutes
+```
+
+The notes also document cache invalidation after balance-changing operations such as:
+
+```text
+Deposit
+Withdrawal
+```
+
+
+
+---
+
+# 8.4 Redis Architecture in CitiCore
+
+```text
+                    Client
+                       |
+                       v
+                 API Gateway
+                       |
+                       v
+                Account Service
+                       |
+              Check Redis Cache
+                       |
+             +---------+---------+
+             |                   |
+          CACHE HIT           CACHE MISS
+             |                   |
+             v                   v
+       Return Balance       Query Database
+                                 |
+                                 v
+                           Account Balance
+                                 |
+                                 v
+                          Store in Redis
+                                 |
+                                 v
+                           Return Balance
+```
+
+For balance updates:
+
+```text
+Deposit / Withdrawal
+        |
+        v
+Account Service
+        |
+        v
+Update Database
+        |
+        v
+Invalidate Redis Cache
+        |
+        v
+Next Read
+        |
+        v
+Load Fresh Value
+```
+
+This is a form of the **cache-aside pattern**.
+
+---
+
+# 8.5 Caching Strategy
+
+## Concept
+
+CitiCore uses a practical cache-aside approach.
+
+The application controls the cache directly.
+
+The flow is:
+
+```text
+Application
+     |
+     v
+Check Redis
+     |
+     +---- HIT
+     |       |
+     |       v
+     |   Return cached data
+     |
+     +---- MISS
+             |
+             v
+         Query database
+             |
+             v
+         Store result in Redis
+             |
+             v
+         Return result
+```
+
+This approach is useful because the database remains the primary source of truth.
+
+Redis acts as a temporary performance layer.
+
+---
+
+# 8.6 Cache Key Design
+
+The documented balance cache uses:
+
+```text
+balance:<accountNumber>
+```
+
+For example:
+
+```text
+balance:ACC123456
+```
+
+The implementation defines:
+
+```java
+private static final String BALANCE_KEY_PREFIX = "balance:";
+```
+
+and constructs the key using the account number.
+
+
+
+## Why Use a Prefix?
+
+Prefixes help organize keys.
+
+For example:
+
+```text
+balance:12345
+user:12345
+rate-limit:client-123
+```
+
+Without prefixes:
+
+```text
+12345
+```
+
+the meaning of the key becomes unclear.
+
+A structured key naming convention is especially important when multiple services or features share the same Redis infrastructure.
+
+---
+
+# 8.7 Cache TTL
+
+## CitiCore Implementation
+
+The documented implementation uses a cache TTL of:
+
+```text
+30 minutes
+```
+
+The code defines:
+
+```java
+private static final long CACHE_TTL =
+    30 * 60 * 1000;
+```
+
+The value is then converted to seconds when creating the Redis expiration duration.
+
+
+
+---
+
+## Why Use TTL?
+
+Without expiration:
+
+```text
+Redis
+   |
+   v
+Old data may remain indefinitely
+```
+
+TTL automatically removes cached data after a configured period.
+
+```text
+Cache Entry Created
+       |
+       v
+TTL Starts
+       |
+       v
+30 Minutes
+       |
+       v
+Entry Expires
+```
+
+The next request becomes a cache miss and retrieves fresh data from the database.
+
+---
+
+# 8.8 Cache Hit
+
+A cache hit occurs when the requested data already exists in Redis.
+
+```text
+Request Balance
+      |
+      v
+Redis
+      |
+      v
+Value Found
+      |
+      v
+CACHE HIT
+      |
+      v
+Return Value
+```
+
+The documented implementation checks:
+
+```java
+String cachedBalance =
+    redis.opsForValue()
+         .get(BALANCE_KEY_PREFIX + accountNumber);
+
+if (cachedBalance != null) {
+    return new BigDecimal(cachedBalance);
+}
+```
+
+
+
+A cache hit avoids a database query.
+
+---
+
+# 8.9 Cache Miss
+
+A cache miss occurs when Redis does not contain the requested value.
+
+```text
+Request Balance
+      |
+      v
+Redis
+      |
+      v
+Value Not Found
+      |
+      v
+CACHE MISS
+      |
+      v
+Query Database
+      |
+      v
+Store Result in Redis
+      |
+      v
+Return Result
+```
+
+The CitiCore implementation follows this pattern:
+
+```java
+BigDecimal balance = accountRepository
+    .findByAccountNumber(accountNumber)
+    .map(Account::getBalance)
+    .orElse(BigDecimal.ZERO);
+```
+
+Then the value is stored in Redis with the configured TTL.
+
+
+
+---
+
+# 8.10 CitiCore Balance Caching Flow
+
+```text
+Client
+   |
+   v
+GET Balance
+   |
+   v
+Account Service
+   |
+   v
+Redis
+   |
+   +--------------------------+
+   |                          |
+   v                          v
+HIT                        MISS
+   |                          |
+   v                          v
+Return Cached              MySQL / RDS
+Balance                       |
+                              v
+                        Get Balance
+                              |
+                              v
+                        Store in Redis
+                              |
+                              v
+                        Return Balance
+```
+
+This reduces repeated database reads for the same account balance.
+
+---
+
+# 8.11 Important Implementation Detail — Source of Truth
+
+Redis is **not** the source of truth for account balances.
+
+The source of truth remains:
+
+```text
+MySQL / RDS
+```
+
+The architecture is:
+
+```text
+                    Source of Truth
+                         |
+                         v
+                    MySQL / RDS
+                         |
+                         v
+                     Redis Cache
+```
+
+Redis contains a temporary cached representation.
+
+This distinction is important in a banking application.
+
+A cache may be cleared or restarted.
+
+The system should still be able to recover data from the database.
+
+---
+
+# 8.12 Cache Invalidation
+
+## Problem
+
+Suppose Redis contains:
+
+```text
+balance:ACC123 = 1000
+```
+
+Then a deposit occurs:
+
+```text
+Database balance = 1500
+Redis balance    = 1000
+```
+
+Now Redis contains stale data.
+
+Therefore the cache must be handled when balance-changing operations occur.
+
+---
+
+## CitiCore Implementation
+
+The notes document cache invalidation using:
+
+```java
+public void invalidateBalance(String accountNumber) {
+
+    redis.delete(
+        BALANCE_KEY_PREFIX + accountNumber
+    );
+
+    logger.debug(
+        "Cache invalidated for account: {}",
+        accountNumber
+    );
+}
+```
+
+
+
+The documented use case is:
+
+```text
+Deposit
+Withdrawal
+     |
+     v
+Invalidate balance cache
+```
+
+The next read retrieves a fresh value from the database.
+
+---
+
+# 8.13 Why Invalidate Instead of Immediately Updating the Cache?
+
+There are two common approaches.
+
+## Option 1 — Update Cache
+
+```text
+Database Update
+      |
+      v
+Update Redis Value
+```
+
+## Option 2 — Invalidate Cache
+
+```text
+Database Update
+      |
+      v
+Delete Redis Key
+```
+
+CitiCore's documented implementation uses invalidation.
+
+The next read then follows:
+
+```text
+Cache MISS
+    |
+    v
+Database
+    |
+    v
+Fresh Cache Value
+```
+
+This approach avoids maintaining separate balance-update logic for both:
+
+```text
+Database
++
+Cache
+```
+
+However, invalidation can temporarily cause the next request to hit the database.
+
+---
+
+# 8.14 Important Banking Consideration
+
+Account balances are sensitive data.
+
+Caching them requires careful consistency handling.
+
+For example:
+
+```text
+User checks balance
+       |
+       v
+Redis returns 1000
+```
+
+At the same time:
+
+```text
+Transaction Service
+       |
+       v
+Debit 500
+       |
+       v
+Database balance = 500
+```
+
+If the cache is not invalidated correctly:
+
+```text
+Redis may still return:
+
+1000
+```
+
+Therefore, balance-changing operations must ensure that stale cache data does not remain valid longer than intended.
+
+For financial operations, the database remains the authoritative source.
+
+Critical write or validation paths should not blindly depend on potentially stale cached data.
+
+---
+
+# 8.15 Redis Configuration
+
+The CitiCore notes document the following Redis configuration:
+
+```yaml
+spring:
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 2000ms
+      lettuce:
+        pool:
+          max-active: 20
+          max-idle: 10
+          min-idle: 5
+```
+
+
+
+---
+
+# 8.16 Important Configuration Explained
+
+## Redis Host
+
+```yaml
+host: ${REDIS_HOST:localhost}
+```
+
+This allows the Redis host to come from an environment variable.
+
+For local development:
+
+```text
+REDIS_HOST
+   |
+   +---- Not provided
+          |
+          v
+       localhost
+```
+
+For deployed environments:
+
+```text
+REDIS_HOST
+   |
+   v
+Redis server address
+```
+
+This makes the application configuration environment-dependent without hardcoding the production address into the application code.
+
+---
+
+## Redis Port
+
+```yaml
+port: ${REDIS_PORT:6379}
+```
+
+Redis commonly listens on:
+
+```text
+6379
+```
+
+The environment variable allows the deployment configuration to override the default if necessary.
+
+---
+
+## Timeout
+
+```yaml
+timeout: 2000ms
+```
+
+The configured timeout is:
+
+```text
+2 seconds
+```
+
+A timeout prevents an application thread from waiting indefinitely for Redis.
+
+Conceptually:
+
+```text
+Application
+     |
+     v
+Redis Request
+     |
+     +---- Response → Continue
+     |
+     +---- No response after timeout
+               |
+               v
+            Failure path
+```
+
+Timeout configuration is important because Redis is an external dependency.
+
+---
+
+# 8.17 Lettuce Connection Pool
+
+The documented configuration includes:
+
+```yaml
+lettuce:
+  pool:
+    max-active: 20
+    max-idle: 10
+    min-idle: 5
+```
+
+
+
+The values represent the configured connection-pool behavior in the CitiCore notes.
+
+### `max-active`
+
+```text
+Maximum active connections:
+20
+```
+
+### `max-idle`
+
+```text
+Maximum idle connections:
+10
+```
+
+### `min-idle`
+
+```text
+Minimum idle connections:
+5
+```
+
+Connection pooling avoids repeatedly creating connections for every Redis operation.
+
+---
+
+# 8.18 Why Connection Pooling Matters
+
+Without reuse:
+
+```text
+Request
+   |
+   v
+Create Connection
+   |
+   v
+Redis
+   |
+   v
+Close Connection
+```
+
+Repeated connection creation can add unnecessary overhead.
+
+With pooling:
+
+```text
+Request
+   |
+   v
+Connection Pool
+   |
+   v
+Reusable Redis Connection
+```
+
+However, connection-pool sizes should be based on actual workload and infrastructure capacity.
+
+The configured values should not be presented as universally optimal production values.
+
+---
+
+# 8.19 Redis Implementation
+
+The documented CitiCore implementation uses:
+
+```java
+StringRedisTemplate
+```
+
+The relevant service structure is:
+
+```java
+@Service
+public class BalanceCacheService {
+
+    @Autowired
+    private StringRedisTemplate redis;
+
+    @Autowired
+    private AccountRepository accountRepository;
+
+    private static final String BALANCE_KEY_PREFIX =
+        "balance:";
+
+    private static final long CACHE_TTL =
+        30 * 60 * 1000;
+}
+```
+
+
+
+---
+
+# 8.20 Balance Retrieval Implementation
+
+A simplified version of the documented implementation is:
+
+```java
+public BigDecimal getBalance(String accountNumber) {
+
+    String key = BALANCE_KEY_PREFIX + accountNumber;
+
+    String cachedBalance =
+        redis.opsForValue().get(key);
+
+    if (cachedBalance != null) {
+
+        return new BigDecimal(cachedBalance);
+    }
+
+    BigDecimal balance = accountRepository
+        .findByAccountNumber(accountNumber)
+        .map(Account::getBalance)
+        .orElse(BigDecimal.ZERO);
+
+    redis.opsForValue().set(
+        key,
+        balance.toString(),
+        Duration.ofMinutes(30)
+    );
+
+    return balance;
+}
+```
+
+The logic follows:
+
+```text
+Redis
+  |
+  +---- Value exists
+  |       |
+  |       v
+  |   Return value
+  |
+  +---- Value missing
+          |
+          v
+       Database
+          |
+          v
+       Cache value
+          |
+          v
+       Return value
+```
+
+---
+
+# 8.21 Why Store Balance as a String?
+
+The documented implementation uses:
+
+```java
+StringRedisTemplate
+```
+
+Therefore the balance is stored as:
+
+```java
+balance.toString()
+```
+
+and retrieved as:
+
+```java
+new BigDecimal(cachedBalance)
+```
+
+This provides explicit conversion between:
+
+```text
+Redis String
+      ⇅
+Java BigDecimal
+```
+
+For financial values, using `BigDecimal` in Java is appropriate for precise decimal arithmetic.
+
+The Redis value is still only a cached representation; the database remains authoritative.
+
+---
+
+# 8.22 Cache Invalidation Flow
+
+For a balance-changing operation:
+
+```text
+Deposit / Withdrawal
+        |
+        v
+Business Operation
+        |
+        v
+Update Database
+        |
+        v
+Invalidate:
+balance:<accountNumber>
+        |
+        v
+Next Read
+        |
+        v
+Cache MISS
+        |
+        v
+Load Fresh Database Value
+```
+
+This is the documented CitiCore caching strategy.
+
+---
+
+# 8.23 Redis in API Gateway
+
+Redis is also referenced in the CitiCore architecture as the backing component for API Gateway rate limiting.
+
+The architecture notes describe:
+
+```text
+API Gateway
+    |
+    +---- Rate limiting via Redis
+```
+
+
+
+This topic should be understood separately from balance caching.
+
+---
+
+## Why Use Redis for Rate Limiting?
+
+Rate limiting needs shared state.
+
+For example:
+
+```text
+Request 1
+Request 2
+Request 3
+```
+
+The system needs to track how many requests a client has made.
+
+In a distributed deployment:
+
+```text
+Gateway Instance 1
+Gateway Instance 2
+Gateway Instance 3
+```
+
+a local in-memory counter on one gateway would not automatically be shared with the others.
+
+Redis provides centralized shared state:
+
+```text
+Gateway 1
+    |
+Gateway 2 ----> Redis
+    |
+Gateway 3
+```
+
+This makes Redis useful for distributed rate limiting.
+
+Detailed API Gateway rate-limiting configuration belongs to **Topic 5 — API Gateway** and should not be duplicated here.
+
+---
+
+# 8.24 Redis Failure Handling
+
+Redis is an external dependency.
+
+Therefore CitiCore should distinguish between:
+
+```text
+Cache failure
+```
+
+and:
+
+```text
+Database failure
+```
+
+For balance reads:
+
+```text
+Client
+   |
+   v
+Account Service
+   |
+   v
+Redis
+   |
+   X
+Unavailable
+```
+
+The application should ideally be able to fall back to the database rather than treating a cache failure as equivalent to losing the underlying data.
+
+Conceptually:
+
+```text
+Redis
+   |
+   +---- Available
+   |       |
+   |       v
+   |    Use Cache
+   |
+   +---- Unavailable
+           |
+           v
+        Database
+```
+
+This follows the principle:
+
+> **A cache should improve performance, but the application should not treat cached data as the only source of truth.**
+
+The current notes document Redis configuration and caching behavior but do not clearly document a specific production fallback implementation using circuit breakers or custom Redis exception handling. Therefore such behavior should be treated as a production consideration rather than a confirmed CitiCore implementation.
+
+---
+
+# 8.25 Cache Failure vs Database Failure
+
+These failures have different severity.
+
+## Redis Failure
+
+```text
+Redis unavailable
+      |
+      v
+Performance impact
+```
+
+The application may still retrieve data from the database.
+
+## Database Failure
+
+```text
+Database unavailable
+      |
+      v
+Authoritative data unavailable
+```
+
+This is generally more serious.
+
+Therefore:
+
+```text
+Redis
+=
+Performance layer
+
+Database
+=
+Persistent source of truth
+```
+
+---
+
+# 8.26 Real CitiCore Redis Configuration
+
+The source notes document these ECS environment values:
+
+```text
+REDIS_HOST=10.0.1.87
+REDIS_PORT=6379
+```
+
+
+
+These values represent the documented project environment at the time of implementation.
+
+They should not be treated as permanent infrastructure values or reused as a general production configuration.
+
+The important architectural lesson is:
+
+```text
+Application
+   |
+   v
+Environment Variable
+   |
+   v
+Redis Host / Port
+```
+
+rather than:
+
+```text
+Application Code
+   |
+   v
+Hardcoded Redis Address
+```
+
+---
+
+# 8.27 Redis and ECS
+
+A containerized application should not assume:
+
+```text
+localhost
+```
+
+always refers to Redis.
+
+Inside a container:
+
+```text
+localhost
+```
+
+usually refers to the same container.
+
+Therefore deployed applications should use the appropriate network address or service hostname.
+
+Conceptually:
+
+```text
+Account Service Container
+       |
+       v
+REDIS_HOST
+       |
+       v
+Redis Instance
+```
+
+This principle is especially important when moving from local development to Docker or ECS environments.
+
+---
+
+# 8.28 Cache Consistency Trade-off
+
+Caching introduces a trade-off:
+
+```text
+Freshness
+    vs
+Performance
+```
+
+### No Cache
+
+```text
+Every request
+     |
+     v
+Database
+```
+
+Advantages:
+
+* Always reads current database data
+* Simpler consistency model
+
+Disadvantages:
+
+* More database load
+* Potentially slower repeated reads
+
+---
+
+### Cache
+
+```text
+Request
+   |
+   v
+Redis
+```
+
+Advantages:
+
+* Faster repeated reads
+* Reduced database load
+
+Disadvantages:
+
+* Stale data is possible
+* Cache invalidation is required
+* Additional infrastructure dependency
+
+CitiCore uses caching for performance while keeping the database as the authoritative source.
+
+---
+
+# 8.29 Why Caching Account Balances Requires Care
+
+A banking application cannot treat every cached value as suitable for every operation.
+
+Consider:
+
+```text
+Redis Balance = 1000
+```
+
+A withdrawal request requires a correct balance decision.
+
+If another transaction changed the balance:
+
+```text
+Actual Database Balance = 500
+```
+
+using stale cached data for a critical debit decision could create correctness problems.
+
+Therefore, conceptually:
+
+```text
+Frequently viewed data
+        |
+        v
+Cache can be useful
+```
+
+but:
+
+```text
+Critical financial write validation
+        |
+        v
+Requires strong consistency
+```
+
+The exact datasource and consistency routing used by CitiCore is covered in the **Database Architecture** topic.
+
+---
+
+# 8.30 Redis Cache Lifecycle
+
+The CitiCore balance cache lifecycle is:
+
+```text
+                    DATABASE
+                        |
+                        |
+                  Balance Read
+                        |
+                        v
+                     REDIS
+                        |
+              +---------+---------+
+              |                   |
+            HIT                 MISS
+              |                   |
+              v                   v
+           Return              Load DB
+                                  |
+                                  v
+                            Store in Redis
+                                  |
+                                  v
+                               Return
+```
+
+When the balance changes:
+
+```text
+Database Write
+      |
+      v
+Delete Cache Key
+      |
+      v
+Fresh Value Loaded
+on next read
+```
+
+When TTL expires:
+
+```text
+Cache Entry
+    |
+    v
+30 Minutes
+    |
+    v
+Expired
+    |
+    v
+Next Request = MISS
+```
+
+---
+
+# 8.31 Cache Stampede Consideration
+
+### Concept
+
+Suppose a popular cache entry expires.
+
+```text
+Cache Entry Expires
+       |
+       v
+Many Requests Arrive
+       |
+       v
+All See Cache MISS
+       |
+       v
+All Query Database
+```
+
+This can create a sudden database load spike.
+
+This problem is called a **cache stampede** or **cache thundering herd** scenario.
+
+The current CitiCore notes do not document a specific cache-stampede protection mechanism.
+
+Possible production strategies include:
+
+```text
+Request coalescing
+Distributed locking
+TTL jitter
+Background refresh
+```
+
+These are **future production considerations**, not confirmed current implementation details.
+
+---
+
+# 8.32 Cache Penetration Consideration
+
+Another caching concern is repeated requests for data that does not exist.
+
+Example:
+
+```text
+Request account: INVALID123
+       |
+       v
+Cache MISS
+       |
+       v
+Database
+       |
+       v
+Not Found
+```
+
+If repeated:
+
+```text
+Many requests
+       |
+       v
+Many database queries
+```
+
+A production system may consider negative caching in carefully selected situations.
+
+However, the current CitiCore notes do not document negative caching as an implementation.
+
+---
+
+# 8.33 Redis Monitoring
+
+Useful Redis-related metrics in a production environment include:
+
+```text
+Cache hit rate
+Cache miss rate
+Redis latency
+Connection count
+Memory usage
+Evicted keys
+Expired keys
+Command failures
+```
+
+For CitiCore balance caching, useful application-level metrics could include:
+
+```text
+Balance cache HIT count
+Balance cache MISS count
+Database fallback count
+Cache invalidation count
+Redis errors
+```
+
+These help determine whether Redis is actually improving performance.
+
+---
+
+# 8.34 Cache Hit Ratio
+
+A useful metric is:
+
+```text
+Cache Hit Ratio
+
+=
+Cache Hits
+-------------------------
+Cache Hits + Cache Misses
+```
+
+For example:
+
+```text
+Illustrative Example
+
+Hits   = 900
+Misses = 100
+
+Hit Ratio = 90%
+```
+
+A higher hit ratio may reduce database reads, but it is not automatically better in every case.
+
+For example, a very long TTL might improve the hit ratio while increasing the risk of stale data.
+
+Therefore:
+
+```text
+Cache efficiency
+      +
+Data freshness
+```
+
+must be balanced.
+
+---
+
+# 8.35 Redis Security Considerations
+
+Redis should not be treated as a publicly exposed data store.
+
+Production considerations include:
+
+```text
+Private network access
+Authentication
+TLS where required
+Security groups / firewall rules
+No public exposure
+Secret management
+Access monitoring
+```
+
+For CitiCore, environment-specific infrastructure and security details belong to the AWS Infrastructure and Database Security topics.
+
+The main Redis principle is:
+
+```text
+Application
+      |
+      v
+Private Redis Access
+```
+
+not:
+
+```text
+Internet
+      |
+      v
+Public Redis Instance
+```
+
+---
+
+# 8.36 Production Considerations
+
+## 1. Redis Should Not Be the Source of Truth
+
+For banking data:
+
+```text
+MySQL / RDS
+      |
+      v
+Source of Truth
+```
+
+Redis remains:
+
+```text
+Performance Layer
+```
+
+---
+
+## 2. Cache Failure Should Be Handled Gracefully
+
+```text
+Redis Down
+     |
+     v
+Fallback where appropriate
+     |
+     v
+Database
+```
+
+The system should not unnecessarily fail an otherwise valid read simply because the cache is unavailable.
+
+---
+
+## 3. Cache Invalidation Must Follow Data Changes
+
+For cached balance data:
+
+```text
+Balance Update
+      |
+      v
+Cache Invalidated
+```
+
+Otherwise stale data may remain visible.
+
+---
+
+## 4. Sensitive Data Should Be Evaluated Carefully
+
+Not every piece of banking information should be cached.
+
+Before caching, consider:
+
+```text
+Sensitivity
+TTL
+Consistency requirements
+Access control
+Memory usage
+```
+
+---
+
+## 5. Monitor Memory Usage
+
+Redis stores data in memory.
+
+Therefore:
+
+```text
+More keys
+    |
+    v
+More memory
+```
+
+A production environment should monitor:
+
+```text
+Memory
+Evictions
+Latency
+Connections
+```
+
+---
+
+# 8.37 Current CitiCore Implementation vs Future Improvements
+
+## Current CitiCore Implementation
+
+The notes document:
+
+```text
+Redis
+   |
+   +---- Account balance caching
+   |
+   +---- 30-minute TTL
+   |
+   +---- Cache-aside read flow
+   |
+   +---- Cache invalidation for balance changes
+   |
+   +---- API Gateway rate-limiting support
+```
+
+The documented Account Service implementation uses:
+
+```text
+StringRedisTemplate
+balance:<accountNumber>
+30-minute TTL
+```
+
+
+
+---
+
+## Future Production Improvements
+
+Possible future improvements include:
+
+```text
+Redis high availability
+Redis Cluster
+Centralized monitoring
+Cache fallback policies
+Cache stampede protection
+Better metrics
+Key naming standards
+Distributed tracing
+```
+
+These should be described as improvements rather than existing CitiCore functionality unless implemented and verified later.
+
+---
+
+# 8.38 Trade-offs
+
+## Advantages
+
+### Faster Repeated Reads
+
+```text
+Redis
+   |
+   v
+Memory-based access
+```
+
+can avoid repeated database queries.
+
+---
+
+### Reduced Database Load
+
+```text
+Repeated Reads
+      |
+      v
+Redis
+      |
+      v
+Fewer Database Queries
+```
+
+---
+
+### Distributed Rate Limiting Support
+
+Redis can provide shared counters/state across multiple API Gateway instances.
+
+---
+
+### Simple Cache-Aside Pattern
+
+The application controls:
+
+```text
+Read
+Write
+Cache
+Invalidation
+```
+
+which makes the behavior explicit.
+
+---
+
+## Disadvantages
+
+### Stale Data
+
+Cached data can become outdated.
+
+---
+
+### Cache Invalidation Complexity
+
+Every relevant data update must consider the cache.
+
+---
+
+### Additional Infrastructure
+
+The system now depends on:
+
+```text
+Redis
+```
+
+as another infrastructure component.
+
+---
+
+### Memory Constraints
+
+Redis data consumes memory.
+
+---
+
+### Distributed Consistency Complexity
+
+The application must handle:
+
+```text
+Database state
+      +
+Cache state
+```
+
+correctly.
+
+---
+
+# 8.39 Alternatives
+
+## No Cache
+
+```text
+Application
+     |
+     v
+Database
+```
+
+Simpler but may create more database load.
+
+---
+
+## Local In-Memory Cache
+
+```text
+Service Instance
+      |
+      v
+Local Cache
+```
+
+Fast but difficult to share or invalidate across multiple service instances.
+
+---
+
+## Redis
+
+```text
+Service 1
+Service 2
+Service 3
+     |
+     v
+   Redis
+```
+
+Useful for distributed systems because the cache can be shared.
+
+---
+
+## Write-Through Cache
+
+```text
+Application Write
+      |
+      +---- Database
+      |
+      +---- Cache
+```
+
+Can reduce stale data but adds write-path complexity.
+
+CitiCore's documented implementation instead uses cache invalidation for balance updates.
+
+---
+
+# 8.40 How I Would Explain Redis in an Interview
+
+> "In CitiCore, I used Redis primarily as a caching layer to reduce repeated database reads for account balances. The Account Service follows a cache-aside pattern. When a balance is requested, it first checks Redis using a key such as `balance:<accountNumber>`. On a cache hit, it returns the value directly. On a miss, it reads the balance from the database, stores it in Redis with a 30-minute TTL, and returns it.
+>
+> When the balance changes through operations such as deposit or withdrawal, the cache entry is invalidated so that the next read loads a fresh value from the database.
+>
+> The database remains the source of truth. Redis is used as a performance optimization, so critical consistency-sensitive operations should not rely blindly on stale cached data. Redis is also used in the architecture to support API Gateway rate limiting."
+
+---
+
+# 8.41 30-Second Interview Answer
+
+> "Redis in CitiCore is mainly used as a distributed caching layer and for API Gateway rate limiting. For account balances, we use the cache-aside pattern: Redis is checked first, and on a cache miss the value is loaded from MySQL and cached with a 30-minute TTL. When the balance changes, we invalidate the cache. MySQL remains the source of truth because Redis is only a performance layer."
+
+---
+
+# 8.42 Interview Follow-up Questions
+
+## Q1. Why did you choose Redis?
+
+**Answer:**
+
+Redis is an in-memory data store suitable for low-latency caching and shared distributed state. In CitiCore, it reduces repeated database reads and supports API Gateway rate limiting.
+
+---
+
+## Q2. What caching pattern did you use?
+
+**Answer:**
+
+CitiCore uses the cache-aside pattern for account balance caching. The application checks Redis first. On a miss, it loads the value from the database and stores it in Redis.
+
+---
+
+## Q3. What happens on a cache hit?
+
+**Answer:**
+
+The application returns the value directly from Redis without querying the database.
+
+---
+
+## Q4. What happens on a cache miss?
+
+**Answer:**
+
+The application queries the database, stores the retrieved value in Redis with the configured TTL, and returns the result.
+
+---
+
+## Q5. What cache key did you use?
+
+**Answer:**
+
+The documented implementation uses:
+
+```text
+balance:<accountNumber>
+```
+
+The `balance:` prefix helps organize Redis keys.
+
+---
+
+## Q6. What TTL did you use?
+
+**Answer:**
+
+The documented CitiCore balance cache uses a TTL of 30 minutes.
+
+---
+
+## Q7. How do you prevent stale data?
+
+**Answer:**
+
+The current implementation invalidates the balance cache when balance-changing operations such as deposit or withdrawal occur. The next read then loads fresh data from the database.
+
+---
+
+## Q8. Is Redis the source of truth?
+
+**Answer:**
+
+No. MySQL/RDS is the persistent source of truth. Redis is used as a temporary performance layer.
+
+---
+
+## Q9. What happens if Redis is unavailable?
+
+**Answer:**
+
+For cacheable reads, the application should ideally fall back to the database where appropriate. Redis failure is primarily a performance problem, while database failure affects access to the authoritative data.
+
+The current CitiCore notes document the cache implementation but do not clearly document a specific custom Redis fallback mechanism.
+
+---
+
+## Q10. Can cached balance data be stale?
+
+**Answer:**
+
+Yes. That is why balance-changing operations must invalidate or update the cache. Critical financial operations should also consider strong consistency requirements.
+
+---
+
+## Q11. Why not use local in-memory caching?
+
+**Answer:**
+
+Local caches are isolated per application instance. In a microservices deployment with multiple instances, cache state becomes harder to share and invalidate consistently. Redis provides centralized shared caching.
+
+---
+
+## Q12. What is cache invalidation?
+
+**Answer:**
+
+It means removing or updating a cached entry when the underlying data changes.
+
+In CitiCore:
+
+```text
+Balance Update
+      |
+      v
+Delete balance cache key
+```
+
+---
+
+## Q13. What is a cache stampede?
+
+**Answer:**
+
+It occurs when many requests experience a cache miss simultaneously and all query the database, potentially creating a sudden load spike.
+
+The current CitiCore implementation does not document a specific stampede protection mechanism.
+
+---
+
+## Q14. Why is Redis useful for rate limiting?
+
+**Answer:**
+
+Rate limiting requires shared counters or state. Redis allows multiple API Gateway instances to use the same centralized rate-limit data.
+
+---
+
+# 8.43 Key Things to Remember
+
+```text
+Redis
+  |
+  +---- In-memory data store
+  |
+  +---- Used for caching
+  |
+  +---- Used for distributed rate limiting
+```
+
+CitiCore balance flow:
+
+```text
+Request
+   |
+   v
+Redis
+   |
+   +---- HIT
+   |       |
+   |       v
+   |   Return Balance
+   |
+   +---- MISS
+           |
+           v
+        Database
+           |
+           v
+        Cache Result
+           |
+           v
+        Return Balance
+```
+
+Balance update:
+
+```text
+Database Update
+      |
+      v
+Invalidate Cache
+      |
+      v
+Next Read Loads Fresh Data
+```
+
+Core principle:
+
+> **Redis improves performance, but MySQL remains the source of truth.**
+
+---
+
+# 8.44 Topic Summary
+
+CitiCore uses Redis as a distributed performance and infrastructure component.
+
+The documented implementation includes:
+
+```text
+Account Service
+      |
+      +---- Balance caching
+      |
+      +---- Cache-aside pattern
+      |
+      +---- balance:<accountNumber>
+      |
+      +---- 30-minute TTL
+      |
+      +---- Cache invalidation after balance changes
+```
+
+The broader CitiCore architecture also uses Redis to support:
+
+```text
+API Gateway
+      |
+      v
+Rate Limiting
+```
+
+The most important design principle is:
+
+```text
+Redis
+  |
+  v
+Cache / Performance Layer
+
+MySQL
+  |
+  v
+Persistent Source of Truth
+```
+---
+
+# TOPIC 9 — DATABASE ARCHITECTURE
+
+# 9. Database Architecture
+
+## 9.1 Overview
+
+The database architecture of CitiCore was designed around an important banking-system requirement:
+
+> **Not every database operation has the same consistency and performance requirements.**
+
+For example, consider these operations:
+
+* Creating an account
+* Depositing money
+* Withdrawing money
+* Validating a transfer
+* Checking an account balance
+* Viewing transaction history
+* Viewing account statements
+
+Some operations require the **latest and strongly consistent data**.
+
+Others are primarily read-heavy and can tolerate a small replication delay.
+
+To handle these different requirements, the CitiCore Account Service notes describe a database architecture based on:
+
+* MySQL
+* Primary/Replica architecture
+* Read/write separation
+* Application-level datasource routing
+* Separate HikariCP connection pools
+* Strong reads from the Primary database
+* Eventual-consistent reads from the Replica database
+* Replica health monitoring
+* Fallback to Primary when the Replica is unhealthy
+
+The overall design can be represented as:
+
+```text
+                         Account Service
+                               |
+                               v
+                    DataSource Routing Layer
+                               |
+                  +------------+------------+
+                  |                         |
+                  v                         v
+           PRIMARY DATABASE          REPLICA DATABASE
+           Read + Write              Read Operations
+                  |                         ^
+                  |                         |
+                  +------ Replication ------+
+```
+
+The primary database remains the authoritative database for writes and consistency-sensitive reads. The replica is used to scale selected read operations. 
+
+---
+
+# 9.2 What Is Database Architecture?
+
+## Concept
+
+Database architecture describes how an application organizes and accesses its data infrastructure.
+
+In a simple application:
+
+```text
+Application
+     |
+     v
+Single Database
+```
+
+All operations go to the same database.
+
+This is easy to manage, but as traffic grows:
+
+```text
+Reads
+   +
+Writes
+   +
+Transactions
+   +
+Reports
+   +
+History Queries
+       |
+       v
+Single Database
+       |
+       v
+Potential Bottleneck
+```
+
+A more scalable architecture separates database responsibilities.
+
+In CitiCore:
+
+```text
+                       Application
+                            |
+                            v
+                 Database Routing Layer
+                            |
+              +-------------+-------------+
+              |                           |
+              v                           v
+         Primary DB                   Replica DB
+       Read + Write                  Selected Reads
+```
+
+This approach allows the system to decide which database should handle a particular operation.
+
+---
+
+# 9.3 Why Do We Need This Architecture?
+
+A banking system handles different categories of data operations.
+
+For example:
+
+### Critical Operations
+
+```text
+Deposit
+Withdrawal
+Transfer Validation
+Balance Validation
+```
+
+These operations need the latest data.
+
+### Read-Heavy Operations
+
+```text
+Account Listing
+Transaction History
+Account Statements
+Historical Queries
+```
+
+Some of these operations can tolerate a small replication delay.
+
+If everything goes to one database:
+
+```text
+                Primary Database
+                       |
+        +--------------+--------------+
+        |              |              |
+        v              v              v
+     Writes        Balance Reads   History Reads
+```
+
+then read traffic competes with important write operations.
+
+The CitiCore architecture separates them:
+
+```text
+                         Account Service
+                                |
+                +---------------+---------------+
+                |                               |
+                v                               v
+         Critical Operations              Read-heavy Operations
+                |                               |
+                v                               v
+           Primary DB                      Replica DB
+```
+
+The purpose is not simply to make every query faster.
+
+The purpose is to balance:
+
+```text
+Consistency
+     +
+Performance
+     +
+Scalability
+     +
+Availability
+```
+
+---
+
+# 9.4 CitiCore Database Architecture
+
+## CitiCore Implementation
+
+The CitiCore notes describe the following architecture for the Account Service:
+
+```text
+┌──────────────────────────────────────────────┐
+│              Account Service                 │
+│              Spring Boot                     │
+│                                              │
+│  Service Layer                               │
+│        |                                     │
+│        v                                     │
+│  Routing Context / AOP                       │
+│        |                                     │
+│        v                                     │
+│  AbstractRoutingDataSource                   │
+│        |                                     │
+│   +----+--------------------+                │
+│   |                         |                │
+│   v                         v                │
+│ Primary DataSource     Replica DataSource    │
+│   HikariCP                 HikariCP          │
+└───────┬──────────────────────────┬───────────┘
+        |                          |
+        v                          v
+  MySQL / RDS Primary       MySQL / RDS Replica
+        |                          ^
+        |                          |
+        +------ Replication -------+
+```
+
+The implementation includes:
+
+* A Primary datasource
+* A Replica datasource
+* HikariCP connection pooling for each datasource
+* Application-level routing
+* A routing context
+* Read and Primary-read annotations
+* Replica health checks
+* Primary fallback when the Replica is unhealthy
+
+The database notes specifically describe the use of custom routing logic with `ThreadLocal` context and `AbstractRoutingDataSource`.
+
+---
+
+# 9.5 Primary Database
+
+## What Is the Primary?
+
+The Primary database is the main database responsible for accepting data changes.
+
+Examples include:
+
+```text
+INSERT
+UPDATE
+DELETE
+```
+
+In CitiCore, critical banking operations are routed to the Primary.
+
+Examples:
+
+```text
+Create Account
+Deposit
+Withdrawal
+Fund Transfer
+Balance Validation
+Critical Account Updates
+```
+
+Conceptually:
+
+```text
+Client
+   |
+   v
+Account Service
+   |
+   v
+PRIMARY DATABASE
+   |
+   v
+Write Operation
+```
+
+The Primary is also used for reads where stale data could cause a business or financial correctness issue.
+
+---
+
+# 9.6 Why Writes Must Go to the Primary
+
+Consider a withdrawal.
+
+```text
+Customer
+   |
+   v
+Withdraw ₹500
+   |
+   v
+Current Balance?
+```
+
+The system must check the latest balance before allowing the withdrawal.
+
+Suppose:
+
+```text
+Actual Primary Balance = ₹1,000
+Replica Balance        = ₹1,500
+```
+
+If the application validates the withdrawal using the stale replica value:
+
+```text
+Replica
+   |
+   v
+₹1,500 available
+```
+
+the system could make an incorrect decision.
+
+Therefore:
+
+```text
+Critical Validation
+        |
+        v
+      PRIMARY
+```
+
+The important principle is:
+
+> **A read operation is not automatically safe to send to a Replica. The business consistency requirement determines where the read should go.**
+
+---
+
+# 9.7 Replica Database
+
+## What Is a Replica?
+
+A database replica is a copy of the Primary database.
+
+Changes are replicated from:
+
+```text
+PRIMARY
+   |
+   v
+REPLICA
+```
+
+The replica can then serve selected read operations.
+
+The CitiCore notes describe MySQL replication as asynchronous, meaning there may be a delay between:
+
+```text
+Primary Write
+```
+
+and:
+
+```text
+Replica Update
+```
+
+This delay is called:
+
+```text
+Replica Lag
+```
+
+---
+
+# 9.8 Why Use a Replica?
+
+A replica helps separate read traffic from write traffic.
+
+Without a replica:
+
+```text
+                        Primary
+                           |
+        +------------------+------------------+
+        |                  |                  |
+        v                  v                  v
+      Writes          Balance Reads      History Reads
+```
+
+With a replica:
+
+```text
+                        Application
+                            |
+                +-----------+-----------+
+                |                       |
+                v                       v
+             Primary                 Replica
+                |                       |
+                v                       v
+        Writes + Strong Reads      Read-heavy Queries
+```
+
+This allows the Primary to focus more on critical operations.
+
+The replica can handle selected read traffic.
+
+---
+
+# 9.9 MySQL Replication
+
+## Concept
+
+Replication is the process of copying changes from one database server to another.
+
+The general flow is:
+
+```text
+Primary Database
+       |
+       | INSERT / UPDATE / DELETE
+       v
+Binary Log
+       |
+       v
+Replica Reads Changes
+       |
+       v
+Replica Applies Changes
+       |
+       v
+Replica Database
+```
+
+The CitiCore notes describe MySQL replication using:
+
+* Binary logs
+* Row-based replication
+* GTIDs
+* Replica relay logs
+* Read-only replica configuration
+
+The detailed MySQL replication implementation will be covered only once in the authoritative **Database Architecture / MySQL Replication explanation**, while the upcoming partitioning topic will focus specifically on partitioning rather than repeating replication details. 
+
+---
+
+# 9.10 Primary and Replica Flow
+
+The basic CitiCore data flow is:
+
+```text
+                    WRITE
+                      |
+                      v
+                Account Service
+                      |
+                      v
+                  PRIMARY DB
+                      |
+                      v
+                MySQL Binary Log
+                      |
+                      v
+                 Replication
+                      |
+                      v
+                  REPLICA DB
+```
+
+For reads:
+
+```text
+                    READ REQUEST
+                         |
+                         v
+                 Account Service
+                         |
+                         v
+                Routing Decision
+                         |
+              +----------+----------+
+              |                     |
+              v                     v
+         Strong Read          Eventual Read
+              |                     |
+              v                     v
+          PRIMARY DB            REPLICA DB
+```
+
+---
+
+# 9.11 Read/Write Separation
+
+## What Is Read/Write Separation?
+
+Read/write separation means that database operations are routed based on their purpose.
+
+For example:
+
+```text
+WRITE
+  |
+  v
+PRIMARY
+```
+
+and:
+
+```text
+NON-CRITICAL READ
+       |
+       v
+REPLICA
+```
+
+This is different from simply routing:
+
+```text
+All Reads
+   |
+   v
+Replica
+```
+
+That approach is dangerous for systems where some reads require strong consistency.
+
+---
+
+# 9.12 CitiCore Read Classification
+
+The CitiCore notes classify database operations into different categories.
+
+## Writes
+
+Writes go to the Primary.
+
+Examples:
+
+```text
+Create Account
+Update Account
+Deposit
+Withdrawal
+Transfer
+Status Change
+```
+
+Architecture:
+
+```text
+Service Method
+      |
+      v
+Write Operation
+      |
+      v
+PRIMARY
+```
+
+---
+
+## Strong Reads
+
+Strong reads also go to the Primary.
+
+Examples documented in the notes include:
+
+```text
+Balance Check
+Withdrawal Validation
+Transfer Validation
+Consistency-sensitive operations
+```
+
+Architecture:
+
+```text
+Service Method
+      |
+      v
+Strong Consistency Required
+      |
+      v
+PRIMARY
+```
+
+The reason is replica lag.
+
+---
+
+## Eventual-Consistency Reads
+
+Some read operations can use the Replica.
+
+Examples documented in the notes include:
+
+```text
+Account List
+Transaction History
+Account Statements
+Historical Data
+```
+
+Architecture:
+
+```text
+Service Method
+      |
+      v
+Eventual Consistency Acceptable
+      |
+      v
+REPLICA
+```
+
+This is an important design decision.
+
+> **The routing decision depends on the business requirement of the read, not simply on whether the operation is technically a `SELECT`.**
+
+---
+
+# 9.13 Strong Consistency vs Eventual Consistency
+
+## Strong Consistency
+
+Strong consistency means that the application reads the latest committed value.
+
+Example:
+
+```text
+Primary Balance = ₹5,000
+```
+
+A transaction changes it:
+
+```text
+Primary Balance = ₹4,000
+```
+
+A subsequent critical read should return:
+
+```text
+₹4,000
+```
+
+Therefore:
+
+```text
+Critical Read
+     |
+     v
+PRIMARY
+```
+
+---
+
+## Eventual Consistency
+
+With asynchronous replication:
+
+```text
+Primary
+   |
+   v
+Update
+   |
+   v
+Replica
+```
+
+the Replica may not immediately contain the latest value.
+
+Example:
+
+```text
+Primary = ₹4,000
+
+Replica = ₹5,000
+```
+
+for a short period.
+
+For historical or non-critical reads, this may be acceptable.
+
+For financial validation, it is not.
+
+---
+
+# 9.14 Why Not Send All Reads to the Replica?
+
+This is one of the most important interview questions about this architecture.
+
+Suppose a customer transfers money.
+
+```text
+Primary Balance
+₹5,000
+```
+
+Transfer:
+
+```text
+Transfer ₹1,000
+```
+
+Primary updates:
+
+```text
+₹5,000
+   |
+   v
+₹4,000
+```
+
+But the Replica has not yet caught up:
+
+```text
+Replica
+   |
+   v
+₹5,000
+```
+
+If the application immediately reads from the Replica:
+
+```text
+GET Balance
+   |
+   v
+Replica
+   |
+   v
+₹5,000
+```
+
+the user receives stale information.
+
+For critical business decisions:
+
+```text
+Balance Validation
+Withdrawal Validation
+Transfer Validation
+```
+
+this can cause correctness problems.
+
+Therefore CitiCore uses selective routing.
+
+```text
+                Read Request
+                     |
+                     v
+          Does it require latest data?
+                     |
+              +------+------+
+              |             |
+             YES            NO
+              |             |
+              v             v
+          PRIMARY        REPLICA
+```
+
+---
+
+# 9.15 DataSource Routing
+
+## Concept
+
+A Spring Boot application normally has one datasource:
+
+```text
+Spring Boot
+     |
+     v
+DataSource
+     |
+     v
+Database
+```
+
+CitiCore needs two:
+
+```text
+Spring Boot
+     |
+     +--------+
+     |        |
+     v        v
+Primary    Replica
+```
+
+The application therefore needs a mechanism to decide which datasource should be used for the current operation.
+
+This is called:
+
+```text
+Datasource Routing
+```
+
+---
+
+# 9.16 CitiCore Routing Architecture
+
+The documented CitiCore routing flow is:
+
+```text
+HTTP Request
+     |
+     v
+Controller
+     |
+     v
+Service Method
+     |
+     v
+Annotation / AOP
+     |
+     v
+Routing Context
+     |
+     v
+AbstractRoutingDataSource
+     |
+     +--------------------+
+     |                    |
+     v                    v
+Primary DataSource    Replica DataSource
+     |                    |
+     v                    v
+HikariCP Pool       HikariCP Pool
+     |                    |
+     v                    v
+Primary DB          Replica DB
+```
+
+The routing decision is made before the database operation executes.
+
+---
+
+# 9.17 AbstractRoutingDataSource
+
+Spring provides:
+
+```java
+AbstractRoutingDataSource
+```
+
+This class can route database operations to different datasources dynamically.
+
+Conceptually:
+
+```java
+protected Object determineCurrentLookupKey() {
+    return DataSourceContextHolder.getDataSourceType();
+}
+```
+
+The routing datasource asks:
+
+```text
+Which database should this request use?
+```
+
+The routing context answers:
+
+```text
+PRIMARY
+```
+
+or:
+
+```text
+REPLICA
+```
+
+The datasource routing layer then selects the corresponding connection pool.
+
+---
+
+# 9.18 Routing Context
+
+## Concept
+
+The application needs to store the current routing decision.
+
+For example:
+
+```text
+Current Request
+      |
+      v
+Use PRIMARY
+```
+
+or:
+
+```text
+Current Request
+      |
+      v
+Use REPLICA
+```
+
+The CitiCore notes describe storing this context using:
+
+```text
+ThreadLocal
+```
+
+Conceptually:
+
+```text
+Request Thread
+      |
+      v
+ThreadLocal Context
+      |
+      v
+PRIMARY / REPLICA
+```
+
+---
+
+# 9.19 Why ThreadLocal?
+
+In a typical Spring MVC application, a request is handled by an application thread.
+
+The routing decision belongs to that request.
+
+For example:
+
+```text
+Request A
+Thread 1
+PRIMARY
+```
+
+and:
+
+```text
+Request B
+Thread 2
+REPLICA
+```
+
+Using `ThreadLocal` allows the routing information to remain associated with the current execution thread.
+
+Conceptually:
+
+```java
+private static final ThreadLocal<DataSourceType> CONTEXT =
+        new ThreadLocal<>();
+```
+
+Then:
+
+```java
+CONTEXT.set(DataSourceType.PRIMARY);
+```
+
+or:
+
+```java
+CONTEXT.set(DataSourceType.REPLICA);
+```
+
+---
+
+# 9.20 Important ThreadLocal Problem
+
+`ThreadLocal` must be cleaned up.
+
+This is important because application servers reuse threads.
+
+Suppose:
+
+```text
+Request 1
+   |
+   v
+Thread A
+   |
+   v
+REPLICA
+```
+
+Request 1 finishes.
+
+Later:
+
+```text
+Request 2
+   |
+   v
+Thread A reused
+```
+
+If the routing context was not cleared:
+
+```text
+Thread A
+   |
+   v
+Still contains REPLICA
+```
+
+The new request could accidentally inherit the previous routing decision.
+
+Therefore the routing context should be cleared.
+
+Conceptually:
+
+```java
+try {
+    // Set routing context
+    return proceed();
+} finally {
+    DataSourceContextHolder.clear();
+}
+```
+
+The `finally` block is important because cleanup should happen even when an exception occurs.
+
+This is a key implementation detail from the CitiCore notes. 
+
+---
+
+# 9.21 Routing Annotations
+
+The CitiCore notes describe using annotations to classify database operations.
+
+Examples include:
+
+```text
+@ReadOnly
+```
+
+and:
+
+```text
+@PrimaryRead
+```
+
+The purpose is to make the consistency requirement explicit.
+
+For example:
+
+```java
+@ReadOnly
+public List<Account> getAccounts() {
+    // Route to replica
+}
+```
+
+and:
+
+```java
+@PrimaryRead
+public BigDecimal getBalance(String accountNumber) {
+    // Route to primary
+}
+```
+
+The exact implementation can use AOP to intercept these annotations and set the routing context.
+
+---
+
+# 9.22 Why Annotation-Based Routing?
+
+Without explicit routing, developers may accidentally send critical operations to the wrong database.
+
+Annotation-based routing makes the intention visible.
+
+For example:
+
+```java
+@PrimaryRead
+public BigDecimal getBalance(...) {
+```
+
+immediately communicates:
+
+```text
+This read requires the Primary.
+```
+
+Similarly:
+
+```java
+@ReadOnly
+public List<AccountStatement> getStatements(...) {
+```
+
+communicates:
+
+```text
+This operation can tolerate Replica reads.
+```
+
+This improves:
+
+* Readability
+* Consistency
+* Maintainability
+* Code review
+* Interview explanation
+
+---
+
+# 9.23 Routing Flow Step by Step
+
+Consider a strong read.
+
+### Step 1 — Request Arrives
+
+```text
+Client
+   |
+   v
+Account Service
+```
+
+### Step 2 — Service Method Is Invoked
+
+```text
+Service Method
+```
+
+Example:
+
+```text
+getBalance()
+```
+
+### Step 3 — Routing Annotation Is Detected
+
+```text
+@PrimaryRead
+```
+
+### Step 4 — AOP Sets Routing Context
+
+```text
+ThreadLocal
+   |
+   v
+PRIMARY
+```
+
+### Step 5 — Routing Datasource Checks Context
+
+```text
+AbstractRoutingDataSource
+   |
+   v
+PRIMARY
+```
+
+### Step 6 — Primary Connection Pool Is Selected
+
+```text
+Primary HikariCP
+```
+
+### Step 7 — Query Executes
+
+```text
+PRIMARY DATABASE
+```
+
+### Step 8 — Context Is Cleared
+
+```text
+finally
+   |
+   v
+ThreadLocal.remove()
+```
+
+---
+
+# 9.24 Replica Read Flow
+
+For an eventual-consistency read:
+
+```text
+Client
+   |
+   v
+Account Service
+   |
+   v
+@ReadOnly
+   |
+   v
+AOP
+   |
+   v
+ThreadLocal = REPLICA
+   |
+   v
+AbstractRoutingDataSource
+   |
+   v
+Replica HikariCP
+   |
+   v
+Replica Database
+```
+
+After execution:
+
+```text
+Routing Context Cleared
+```
+
+---
+
+# 9.25 HikariCP
+
+## What Is HikariCP?
+
+HikariCP is a JDBC connection pool.
+
+A database connection is relatively expensive to create.
+
+Without pooling:
+
+```text
+Request
+   |
+   v
+Create DB Connection
+   |
+   v
+Execute Query
+   |
+   v
+Close Connection
+```
+
+Repeated connection creation can add unnecessary overhead.
+
+With HikariCP:
+
+```text
+Request
+   |
+   v
+Connection Pool
+   |
+   v
+Reusable Connection
+   |
+   v
+Database
+```
+
+After use:
+
+```text
+Connection
+   |
+   v
+Returned to Pool
+```
+
+---
+
+# 9.26 CitiCore Connection Pool Architecture
+
+CitiCore uses separate pools conceptually:
+
+```text
+                     Routing Layer
+                          |
+                +---------+---------+
+                |                   |
+                v                   v
+         Primary HikariCP      Replica HikariCP
+                |                   |
+                v                   v
+             Primary              Replica
+```
+
+This separation ensures that the application can independently manage connections to each database endpoint.
+
+For example:
+
+```text
+Primary Pool
+   |
+   +---- Critical Writes
+   |
+   +---- Strong Reads
+```
+
+and:
+
+```text
+Replica Pool
+   |
+   +---- Read-heavy Queries
+```
+
+The database notes describe this dual-pool architecture as part of the Account Service design.
+
+---
+
+# 9.27 Why Separate Connection Pools?
+
+If both databases shared the same connection configuration conceptually:
+
+```text
+Application
+   |
+   v
+Single Pool
+   |
+   +---- Primary
+   |
+   +---- Replica
+```
+
+routing and monitoring would become more complicated.
+
+Separate pools provide clearer boundaries:
+
+```text
+Primary Pool
+   |
+   v
+Primary Database
+```
+
+and:
+
+```text
+Replica Pool
+   |
+   v
+Replica Database
+```
+
+This allows independent monitoring of:
+
+```text
+Active Connections
+Idle Connections
+Connection Failures
+Pool Exhaustion
+```
+
+for each database.
+
+---
+
+# 9.28 Replica Lag
+
+## What Is Replica Lag?
+
+Replica lag is the delay between a change being committed on the Primary and that same change becoming available on the Replica.
+
+Example:
+
+```text
+Time 0
+
+Primary Balance = ₹1,000
+Replica Balance = ₹1,000
+```
+
+A transaction occurs:
+
+```text
+Time 1
+
+Primary Balance = ₹500
+Replica Balance = ₹1,000
+```
+
+After replication catches up:
+
+```text
+Time 2
+
+Primary Balance = ₹500
+Replica Balance = ₹500
+```
+
+The period between Time 1 and Time 2 is the replication lag window.
+
+---
+
+# 9.29 Why Replica Lag Matters in Banking
+
+Replica lag is especially important in banking operations.
+
+Consider:
+
+```text
+Customer Balance = ₹1,000
+```
+
+A withdrawal occurs:
+
+```text
+Withdraw ₹800
+```
+
+Primary:
+
+```text
+₹1,000
+   |
+   v
+₹200
+```
+
+Replica may temporarily remain:
+
+```text
+₹1,000
+```
+
+If another operation checks the Replica:
+
+```text
+Available Balance?
+   |
+   v
+₹1,000
+```
+
+the application could make an incorrect decision.
+
+Therefore:
+
+```text
+Financial Validation
+      |
+      v
+PRIMARY
+```
+
+---
+
+# 9.30 CitiCore Replica Lag Strategy
+
+The CitiCore notes describe a selective routing approach.
+
+```text
+                    READ
+                     |
+                     v
+         Does this require latest data?
+                     |
+             +-------+-------+
+             |               |
+            YES              NO
+             |               |
+             v               v
+         PRIMARY          REPLICA
+```
+
+Examples of Primary reads:
+
+```text
+Balance Check
+Withdrawal Validation
+Transfer Validation
+```
+
+Examples of Replica reads:
+
+```text
+Account List
+Transaction History
+Historical Statements
+```
+
+This is one of the key architectural decisions in CitiCore.
+
+---
+
+# 9.31 Replica Health Monitoring
+
+A Replica should not be used blindly.
+
+The application must consider whether the Replica is:
+
+```text
+Available
+Healthy
+Connected
+Acceptable for reads
+```
+
+The CitiCore notes describe monitoring Replica health and falling back to the Primary when the Replica is unavailable or significantly lagging.
+
+Conceptually:
+
+```text
+Read Request
+      |
+      v
+Replica Health Check
+      |
+      +---- Healthy
+      |        |
+      |        v
+      |    Use Replica
+      |
+      +---- Unhealthy
+               |
+               v
+          Use Primary
+```
+
+This improves availability for read operations.
+
+---
+
+# 9.32 Replica Fallback
+
+Suppose:
+
+```text
+Replica
+   |
+   X
+Unavailable
+```
+
+Without fallback:
+
+```text
+Read Request
+   |
+   v
+ERROR
+```
+
+With fallback:
+
+```text
+Read Request
+   |
+   v
+Replica Available?
+   |
+   +---- YES
+   |       |
+   |       v
+   |    Replica
+   |
+   +---- NO
+           |
+           v
+        Primary
+```
+
+This allows the application to continue serving reads.
+
+However, the Primary may receive additional load.
+
+Therefore, fallback improves availability but can increase pressure on the Primary.
+
+---
+
+# 9.33 Replica Lag Threshold
+
+The existing notes mention monitoring replication lag and using a threshold-based fallback strategy.
+
+Conceptually:
+
+```text
+Replica Lag
+     |
+     v
+Within Acceptable Threshold?
+     |
+ +---+---+
+ |       |
+YES      NO
+ |       |
+ v       v
+Replica  Primary
+```
+
+The source notes mention a specific lag threshold as part of an implementation explanation, but that value should be treated as a project configuration decision rather than a universal production standard. 
+
+A production threshold should depend on:
+
+* Business requirements
+* Query type
+* Data sensitivity
+* Expected replication behavior
+* System load
+
+---
+
+# 9.34 Default-to-Primary Strategy
+
+The CitiCore notes recommend using Primary as the safe default.
+
+Conceptually:
+
+```text
+Routing Context Exists?
+      |
+   +--+--+
+   |     |
+  YES    NO
+   |     |
+   v     v
+Use     PRIMARY
+Context
+```
+
+Why?
+
+Because accidentally reading from the Primary generally gives fresh data, while accidentally reading critical data from a lagging Replica can create correctness issues.
+
+This does not mean all traffic should always use the Primary.
+
+It means that when the routing context is missing or uncertain, a correctness-first default is safer.
+
+---
+
+# 9.35 Database Operation Classification
+
+A useful CitiCore classification is:
+
+| Operation           | Database | Reason                                           |
+| ------------------- | -------- | ------------------------------------------------ |
+| Create Account      | Primary  | Write operation                                  |
+| Deposit             | Primary  | Balance update                                   |
+| Withdrawal          | Primary  | Balance update and validation                    |
+| Fund Transfer       | Primary  | Critical financial consistency                   |
+| Balance Validation  | Primary  | Latest data required                             |
+| Account List        | Replica  | Read scaling where lag is acceptable             |
+| Statement History   | Replica  | Historical read workload                         |
+| Transaction History | Replica  | Read-heavy, depending on consistency requirement |
+
+The important rule is:
+
+> **The business requirement determines the datasource, not only the SQL operation type.**
+
+For example:
+
+```text
+SELECT Balance
+```
+
+is technically a read.
+
+But:
+
+```text
+SELECT Balance before Withdrawal
+```
+
+is a consistency-critical operation.
+
+Therefore:
+
+```text
+SELECT
+≠
+Automatically Replica
+```
+
+---
+
+# 9.36 Strong Reads and Redis
+
+CitiCore also uses Redis for balance caching.
+
+However, caching and datasource routing solve different problems.
+
+```text
+Redis
+   |
+   v
+Reduce repeated reads
+```
+
+while:
+
+```text
+Primary / Replica Routing
+   |
+   v
+Control consistency and database load
+```
+
+For consistency-sensitive operations:
+
+```text
+Critical Operation
+   |
+   v
+Do not blindly trust stale cached data
+   |
+   v
+Use authoritative data path
+```
+
+This distinction is important in a banking application.
+
+The Redis topic contains the authoritative explanation of cache behavior, TTL, and invalidation, so those concepts are not repeated here.
+
+---
+
+# 9.37 Database Source of Truth
+
+The architecture should be understood as:
+
+```text
+                    Source of Truth
+                         |
+                         v
+                     Primary DB
+                         |
+             +-----------+-----------+
+             |                       |
+             v                       v
+         Replica DB              Redis Cache
+```
+
+The roles are different.
+
+### Primary
+
+```text
+Authoritative Writes
+Strong Reads
+```
+
+### Replica
+
+```text
+Replicated Read Scaling
+Eventual Consistency
+```
+
+### Redis
+
+```text
+Performance Cache
+Temporary Data
+```
+
+---
+
+# 9.38 Failure Scenario — Replica Unavailable
+
+Consider:
+
+```text
+Client
+   |
+   v
+Account Service
+   |
+   v
+Replica
+   |
+   X
+Unavailable
+```
+
+The routing layer should detect the failure.
+
+Then:
+
+```text
+Client
+   |
+   v
+Account Service
+   |
+   v
+Replica Unavailable
+   |
+   v
+Fallback
+   |
+   v
+Primary
+```
+
+### Trade-off
+
+The benefit:
+
+```text
+Read remains available
+```
+
+The cost:
+
+```text
+Primary receives more load
+```
+
+Therefore fallback is useful for availability but should be monitored.
+
+---
+
+# 9.39 Failure Scenario — Replica Lag
+
+Consider:
+
+```text
+Primary
+   |
+   v
+New Balance = ₹500
+```
+
+Replica:
+
+```text
+Old Balance = ₹1,000
+```
+
+A critical read should not use the Replica.
+
+The CitiCore strategy is:
+
+```text
+Critical Read
+      |
+      v
+PRIMARY
+```
+
+For non-critical reads:
+
+```text
+Historical Read
+      |
+      v
+REPLICA
+```
+
+This selective approach is safer than routing all reads to the Replica.
+
+---
+
+# 9.40 Failure Scenario — Connection Pool Exhaustion
+
+A database connection pool can become exhausted when:
+
+```text
+Too many concurrent requests
+```
+
+or:
+
+```text
+Connections are not returned
+```
+
+or:
+
+```text
+Connection leaks exist
+```
+
+The flow can become:
+
+```text
+Request
+   |
+   v
+HikariCP
+   |
+   v
+No Available Connection
+   |
+   v
+Timeout / Error
+```
+
+Useful monitoring includes:
+
+```text
+Active Connections
+Idle Connections
+Pending Requests
+Connection Timeouts
+Connection Errors
+```
+
+The source notes include connection-pool exhaustion as a troubleshooting scenario and recommend monitoring HikariCP metrics. 
+
+Detailed troubleshooting will be consolidated later under **Topic 16 — Troubleshooting** to avoid duplicating the same problem explanations.
+
+---
+
+# 9.41 Architecture Decision: Why Not Use Only One Database?
+
+A single database architecture would be:
+
+```text
+Application
+     |
+     v
+Single MySQL Database
+     |
+     +---- Writes
+     +---- Strong Reads
+     +---- History Queries
+     +---- Statement Queries
+```
+
+### Advantages
+
+* Simple architecture
+* Easier deployment
+* No replication lag
+* No routing logic
+
+### Disadvantages
+
+* Read traffic competes with writes
+* Harder to scale read workloads independently
+* Heavy reporting queries can affect critical operations
+
+The Primary/Replica approach adds complexity but provides better separation.
+
+---
+
+# 9.42 Architecture Decision: Why Not Send Every Read to the Replica?
+
+Because:
+
+```text
+Replica
+   |
+   v
+Eventually Consistent
+```
+
+Some reads require:
+
+```text
+Latest Data
+```
+
+Therefore:
+
+```text
+Consistency-sensitive Reads
+           |
+           v
+        Primary
+```
+
+and:
+
+```text
+Scalable Read Operations
+           |
+           v
+        Replica
+```
+
+This is a business-driven consistency decision.
+
+---
+
+# 9.43 Architecture Decision: Why Application-Level Routing?
+
+There are several ways to manage read/write routing.
+
+One approach is infrastructure-level routing.
+
+Another is application-level routing.
+
+CitiCore uses application-aware routing because the application understands the business meaning of an operation.
+
+For example:
+
+```text
+getBalance()
+```
+
+could be:
+
+```text
+Critical validation
+```
+
+or:
+
+```text
+Simple display operation
+```
+
+The SQL statement alone may not contain enough business context to determine the correct datasource.
+
+Application-level routing allows:
+
+```text
+Business Requirement
+       |
+       v
+Routing Decision
+```
+
+---
+
+# 9.44 Trade-offs
+
+## Advantages
+
+### Read Scalability
+
+```text
+Primary
+   +
+Replica
+```
+
+allows selected read workloads to be separated from critical writes.
+
+---
+
+### Better Primary Protection
+
+Heavy read workloads can be moved to the Replica.
+
+```text
+Historical Reads
+      |
+      v
+Replica
+```
+
+This can reduce unnecessary pressure on the Primary.
+
+---
+
+### Strong Consistency Where Needed
+
+Critical operations remain on the Primary.
+
+```text
+Balance Validation
+       |
+       v
+Primary
+```
+
+---
+
+### Improved Availability
+
+Replica fallback strategies can redirect reads to the Primary when necessary.
+
+---
+
+### Clear Business Classification
+
+Annotations and routing logic make consistency decisions explicit.
+
+---
+
+## Disadvantages
+
+### More Infrastructure
+
+The system must manage:
+
+```text
+Primary
+Replica
+Replication
+Connection Pools
+Monitoring
+Routing
+```
+
+---
+
+### Replica Lag
+
+The Replica may contain stale data.
+
+---
+
+### Application Complexity
+
+Developers must correctly classify operations.
+
+A wrong routing decision can cause correctness problems.
+
+---
+
+### Operational Monitoring
+
+The system needs monitoring for:
+
+```text
+Replica Health
+Replication Lag
+Connection Pools
+Database Availability
+```
+
+---
+
+# 9.45 Production Considerations
+
+A production database architecture would require additional considerations.
+
+## Monitoring
+
+Monitor:
+
+```text
+Primary CPU
+Replica CPU
+Connection Count
+Query Latency
+Replica Lag
+Replication Errors
+Disk Usage
+Database Availability
+```
+
+---
+
+## Backup
+
+Replication is not the same as backup.
+
+This is important.
+
+```text
+Primary
+   |
+   v
+Replica
+```
+
+copies changes.
+
+If incorrect data is written:
+
+```text
+Bad Data
+   |
+   v
+Primary
+   |
+   v
+Replica
+```
+
+the error can also replicate.
+
+Therefore production systems still require:
+
+```text
+Automated Backups
+Snapshots
+Point-in-Time Recovery
+```
+
+---
+
+## Failover
+
+A production system should have a documented process for:
+
+```text
+Primary Failure
+      |
+      v
+Promote / Failover
+      |
+      v
+Restore Application Connectivity
+```
+
+The exact AWS RDS failover architecture belongs to the AWS Infrastructure topic.
+
+---
+
+## Connection Pool Tuning
+
+HikariCP settings should be based on:
+
+```text
+Database Capacity
+Application Instances
+Concurrent Requests
+Query Duration
+```
+
+A larger pool is not automatically better.
+
+Too many connections can overload the database.
+
+---
+
+## Query Optimization
+
+Read/Write separation does not replace query optimization.
+
+Poor queries remain poor queries.
+
+The system should still use:
+
+```text
+Indexes
+Query Analysis
+Pagination
+Partitioning where appropriate
+Efficient SQL
+```
+
+---
+
+# 9.46 Important Separation of Concerns
+
+The CitiCore documentation should treat these concepts separately:
+
+### Database Architecture
+
+```text
+Primary
+Replica
+Routing
+Consistency
+Connection Pools
+Health
+```
+
+### MySQL Partitioning
+
+```text
+Large Tables
+Range Partitions
+Partition Pruning
+Maintenance
+```
+
+### Database Security
+
+```text
+TLS
+Database Users
+Read-only Users
+Secrets
+Truststore
+```
+
+### Transactional Outbox
+
+```text
+Database Transaction
+Event Persistence
+Reliable Kafka Publishing
+```
+
+### Redis
+
+```text
+Caching
+TTL
+Invalidation
+Rate Limiting Support
+```
+
+This avoids explaining the same concept multiple times.
+
+---
+
+# 9.47 How I Would Explain the Database Architecture in an Interview
+
+> "In CitiCore, I designed the Account Service database layer using a MySQL Primary and Replica architecture with application-level read/write routing. All writes and consistency-sensitive reads, such as balance validation and withdrawal checks, go to the Primary because the Replica can have asynchronous replication lag.
+>
+> Read-heavy operations where eventual consistency is acceptable, such as historical statements or account listing, can be routed to the Replica. I used separate HikariCP connection pools and Spring's `AbstractRoutingDataSource` to dynamically select the datasource. The routing decision is stored in a request-scoped `ThreadLocal` context and controlled through annotations and AOP.
+>
+> We also monitor Replica availability and fall back to the Primary when the Replica cannot safely serve reads. The key design decision was that not every read is safe for the Replica—the business consistency requirement determines where the query should go."
+
+---
+
+# 9.48 30-Second Interview Answer
+
+> "CitiCore uses a MySQL Primary-Replica architecture with read/write separation. Writes and strong consistency reads go to the Primary, while selected read-heavy operations go to the Replica. We implemented application-level routing using Spring's `AbstractRoutingDataSource`, separate HikariCP pools, and a `ThreadLocal` routing context controlled through annotations and AOP. This allows us to scale read traffic while protecting critical banking operations from replica lag."
+
+---
+
+# 9.49 Interview Follow-up Questions
+
+## Q1. Why did you use a Primary and Replica architecture?
+
+**Answer:**
+
+To separate write traffic from selected read traffic. This helps scale read-heavy workloads without sending every request to the Primary database.
+
+---
+
+## Q2. Do all reads go to the Replica?
+
+**Answer:**
+
+No. Reads requiring the latest data, such as balance validation and financial transaction checks, go to the Primary. Only reads that can tolerate eventual consistency are routed to the Replica.
+
+---
+
+## Q3. What is replica lag?
+
+**Answer:**
+
+Replica lag is the delay between a change being committed on the Primary and that change becoming available on the Replica.
+
+---
+
+## Q4. How did you handle replica lag?
+
+**Answer:**
+
+I used selective routing. Consistency-sensitive reads go directly to the Primary, while non-critical read-heavy operations can use the Replica. Replica health can also be monitored and unhealthy replicas can fall back to the Primary.
+
+---
+
+## Q5. Why did you use `ThreadLocal`?
+
+**Answer:**
+
+The datasource routing decision belongs to the current request execution context. `ThreadLocal` allows the routing information to remain associated with the current application thread.
+
+The important point is that it must be cleared after the request or method execution to prevent thread reuse from causing routing errors.
+
+---
+
+## Q6. What happens if you forget to clear the ThreadLocal?
+
+**Answer:**
+
+Application server threads can be reused. A new request could inherit the previous request's datasource routing decision, potentially sending queries to the wrong database.
+
+---
+
+## Q7. What is `AbstractRoutingDataSource`?
+
+**Answer:**
+
+It is a Spring abstraction that allows the application to dynamically choose a datasource based on a lookup key, such as `PRIMARY` or `REPLICA`.
+
+---
+
+## Q8. Why separate HikariCP pools?
+
+**Answer:**
+
+Separate pools provide independent connection management for the Primary and Replica databases and make routing, monitoring, and failure handling clearer.
+
+---
+
+## Q9. What happens if the Replica is unavailable?
+
+**Answer:**
+
+For reads that can be served safely from the Primary, the application can fall back to the Primary. This improves availability but may increase load on the Primary.
+
+---
+
+## Q10. Does replication replace backups?
+
+**Answer:**
+
+No. Replication copies changes from the Primary to the Replica, including potentially incorrect or accidental changes. Backups and point-in-time recovery are still required.
+
+---
+
+## Q11. Why not use one database for everything?
+
+**Answer:**
+
+A single database is simpler, but all reads and writes compete for the same resources. Primary-Replica architecture allows selected read workloads to scale independently.
+
+---
+
+## Q12. How do you decide whether a query should use Primary or Replica?
+
+**Answer:**
+
+Based on the business consistency requirement. If stale data could cause an incorrect business or financial decision, the query uses the Primary. If eventual consistency is acceptable, it can use the Replica.
+
+---
+
+# 9.50 Key Takeaways
+
+```text
+CitiCore Database Architecture
+          |
+          v
+MySQL Primary + Replica
+          |
+    +-----+-----+
+    |           |
+    v           v
+Primary      Replica
+    |           |
+    v           v
+Writes       Selected Reads
+Strong Reads Eventual Reads
+```
+
+Routing:
+
+```text
+Read Request
+     |
+     v
+Latest Data Required?
+     |
+ +---+---+
+ |       |
+YES      NO
+ |       |
+ v       v
+Primary Replica
+```
+
+Application architecture:
+
+```text
+Service
+   |
+   v
+AOP / Annotation
+   |
+   v
+ThreadLocal Context
+   |
+   v
+AbstractRoutingDataSource
+   |
+   +----------+
+   |          |
+   v          v
+Primary     Replica
+HikariCP    HikariCP
+```
+
+Core principle:
+
+> **In CitiCore, database routing is based on consistency requirements, not simply whether an operation is a read or write.**
+
+---
+
+# 9.51 Topic Summary
+
+The CitiCore database architecture is built around a **Primary-Replica MySQL design with intelligent application-level routing**.
+
+The key components are:
+
+```text
+MySQL
+   |
+   +---- Primary
+   |       |
+   |       +---- Writes
+   |       +---- Strong Reads
+   |
+   +---- Replica
+           |
+           +---- Eventual-Consistency Reads
+```
+
+The Account Service determines the appropriate database using:
+
+```text
+Annotations
+   |
+   v
+AOP
+   |
+   v
+ThreadLocal Routing Context
+   |
+   v
+AbstractRoutingDataSource
+   |
+   v
+Primary / Replica HikariCP Pool
+```
+
+The most important architectural decision is:
+
+> **Not all reads are equal. Banking operations that require the latest state must use the Primary, while selected read-heavy operations can use the Replica for scalability.**
+
+---
+# TOPIC 10 - MySQL Partitioning
+
+# 10.1 Overview
+
+Database partitioning was introduced in CitiCore to address a common problem in transaction-heavy systems: some tables continue to grow over time and eventually become difficult to manage efficiently.
+
+A banking platform continuously generates data.
+
+Examples include:
+
+* Account statements
+* Transaction history
+* Audit records
+* Outbox events
+* Notification events
+* Historical records
+
+Unlike account master data, which usually grows gradually, historical tables can grow very quickly.
+
+For example:
+
+```text
+Accounts
+    |
+    +---- Customer A
+    |        |
+    |        +---- Transactions
+    |        +---- Statements
+    |
+    +---- Customer B
+    |        |
+    |        +---- Transactions
+    |        +---- Statements
+    |
+    +---- Customer C
+             |
+             +---- Transactions
+             +---- Statements
+```
+
+Over several months or years, tables containing historical records can become very large.
+
+The CitiCore database design therefore uses MySQL partitioning for tables where time-based growth is expected and where queries commonly access data from a specific date range.
+
+The notes identify the following tables as important candidates for partitioning:
+
+* `account_statements`
+* `account_outbox`
+
+The primary partitioning approach is:
+
+> **RANGE partitioning based on time.**
+
+Conceptually:
+
+```text
+account_statements
+        |
+        +----------------------+
+        |                      |
+        v                      v
+January Partition         February Partition
+        |                      |
+        v                      v
+March Partition           April Partition
+```
+
+The goal is not simply to split a table into smaller pieces.
+
+The main objectives are:
+
+* Improve management of large historical tables
+* Support efficient time-based queries
+* Allow partition pruning
+* Simplify archival and retention operations
+* Allow old data to be removed efficiently
+* Improve maintenance of time-series data
+
+---
+
+# 10.2 What Is MySQL Partitioning?
+
+## Concept
+
+MySQL partitioning is a database feature that allows a logically single table to be physically divided into multiple partitions.
+
+From the application's perspective:
+
+```text
+SELECT * FROM account_statements;
+```
+
+still queries one table.
+
+However, internally, the database can organize the data into partitions.
+
+Conceptually:
+
+```text
+Logical Table
+account_statements
+        |
+        v
++-----------------------------+
+|                             |
+|  Partitioned Table          |
+|                             |
++-------------+---------------+
+              |
+    +---------+---------+
+    |         |         |
+    v         v         v
+Partition  Partition  Partition
+Jan 2026   Feb 2026   Mar 2026
+```
+
+The application does not normally need to know which partition contains a particular row.
+
+It continues working with:
+
+```text
+account_statements
+```
+
+as one table.
+
+MySQL uses the partitioning definition to determine where data should be stored and which partitions need to be searched.
+
+---
+
+# 10.3 Why Do We Need Partitioning?
+
+Without partitioning, a historical table continues growing as one large structure.
+
+For example:
+
+```text
+account_statements
+
+2024 data
+2025 data
+2026 data
+2027 data
+2028 data
+...
+```
+
+Eventually:
+
+```text
+One Very Large Table
+```
+
+can create operational challenges.
+
+Examples include:
+
+* Large index sizes
+* Longer maintenance operations
+* More difficult archival
+* Expensive deletion of old data
+* Slower range-based scans
+* Increasing storage requirements
+
+Partitioning organizes data according to a defined rule.
+
+For CitiCore:
+
+```text
+Data
+ |
+ v
+Partition Key
+ |
+ v
+Time Range
+ |
+ +--------------------------+
+ |                          |
+ v                          v
+Older Partition        Newer Partition
+```
+
+For example:
+
+```text
+account_statements
+
+p202601
+    |
+    +---- January 2026 statements
+
+p202602
+    |
+    +---- February 2026 statements
+
+p202603
+    |
+    +---- March 2026 statements
+```
+
+This is particularly useful because banking statement data is naturally time-oriented.
+
+Users commonly ask questions such as:
+
+```text
+Show my statements for this month.
+
+Show transactions from January to March.
+
+Show statements for the previous financial year.
+```
+
+These queries naturally align with time-based partitioning.
+
+---
+
+# 10.4 CitiCore Context
+
+## CitiCore Implementation
+
+The CitiCore notes identify two important categories of data that are suitable for partitioning.
+
+### Account Statements
+
+```text
+account_statements
+```
+
+Account statements are historical records and can continuously grow as users perform banking operations.
+
+A simplified example:
+
+```text
+Statement ID
+Account ID
+Transaction ID
+Amount
+Balance
+Statement Date
+Created At
+```
+
+The important characteristic is:
+
+```text
+Historical
++
+Time-based
++
+Continuously growing
+```
+
+Therefore, range partitioning based on a date or timestamp is a suitable approach.
+
+---
+
+### Account Outbox
+
+```text
+account_outbox
+```
+
+The transactional outbox stores events that are created during database transactions and later published to Kafka.
+
+Conceptually:
+
+```text
+Database Transaction
+        |
+        +---- Business Data
+        |
+        +---- Outbox Event
+                  |
+                  v
+             Kafka Publisher
+                  |
+                  v
+               Kafka
+```
+
+Outbox tables can also grow continuously because every relevant business operation can generate an event.
+
+Examples:
+
+```text
+ACCOUNT_CREATED
+ACCOUNT_UPDATED
+ACCOUNT_STATUS_CHANGED
+TRANSACTION_EVENT
+```
+
+After events are processed, the system may retain them for auditing or operational purposes.
+
+Over time:
+
+```text
+Outbox Events
+      |
+      v
+Large Historical Table
+```
+
+Time-based partitioning can make retention and cleanup easier.
+
+---
+
+# 10.5 Why These Tables Are Better Candidates for Partitioning
+
+Not every database table should be partitioned.
+
+This is important.
+
+Partitioning adds complexity.
+
+For example, a relatively small table such as:
+
+```text
+users
+```
+
+may not benefit from partitioning.
+
+Similarly:
+
+```text
+accounts
+```
+
+should not automatically be partitioned simply because it exists in a large application.
+
+Partitioning should solve a real problem.
+
+The CitiCore candidate tables share these characteristics:
+
+```text
+Large Growth Potential
+        +
+Historical Data
+        +
+Time-based Queries
+        +
+Retention Requirements
+```
+
+This makes them better candidates than small or frequently accessed master tables.
+
+---
+
+# 10.6 Why RANGE Partitioning?
+
+## Concept
+
+RANGE partitioning divides rows based on ranges of values.
+
+For a time-based table:
+
+```text
+Date
+ |
+ +-----------------------------+
+ |             |               |
+ v             v               v
+January      February         March
+Partition    Partition        Partition
+```
+
+For example:
+
+```text
+p202601
+January 2026
+
+p202602
+February 2026
+
+p202603
+March 2026
+```
+
+The database decides which partition should contain the row based on the partition key.
+
+---
+
+## Example
+
+Suppose a statement has:
+
+```text
+statement_date = 2026-02-15
+```
+
+The row belongs to:
+
+```text
+February 2026 Partition
+```
+
+Conceptually:
+
+```text
+New Statement
+      |
+      v
+statement_date
+      |
+      v
+2026-02-15
+      |
+      v
+Partition Rule
+      |
+      v
+p202602
+```
+
+This happens based on the partition definition.
+
+---
+
+# 10.7 CitiCore Partitioning Architecture
+
+The high-level architecture is:
+
+```text
+Account Service
+      |
+      v
+MySQL
+      |
+      v
+account_statements
+      |
+      +-----------------------------+
+      |             |               |
+      v             v               v
+   p202601       p202602        p202603
+   January       February       March
+```
+
+For the outbox:
+
+```text
+Business Operation
+       |
+       v
+Database Transaction
+       |
+       +--------------------------+
+       |                          |
+       v                          v
+Business Table              account_outbox
+                                  |
+                                  v
+                         Partitioned by Time
+                                  |
+                       +----------+----------+
+                       |                     |
+                       v                     v
+                    Old Events            New Events
+```
+
+The partitioning strategy is designed around the lifecycle of historical data.
+
+---
+
+# 10.8 Partition Key
+
+A partition key is the column used by MySQL to determine where a row belongs.
+
+For a time-based table, this is usually a date or timestamp column.
+
+Examples:
+
+```text
+statement_date
+```
+
+or:
+
+```text
+created_at
+```
+
+For CitiCore, the partition key should represent the time dimension that best matches how the table is queried and maintained.
+
+This is an important design decision.
+
+For example:
+
+```text
+account_statements
+```
+
+could be partitioned using:
+
+```text
+statement_date
+```
+
+if statement queries are primarily based on statement dates.
+
+Similarly:
+
+```text
+account_outbox
+```
+
+could be partitioned using:
+
+```text
+created_at
+```
+
+if events are managed and retained according to creation time.
+
+The general rule is:
+
+> **Choose a partition key that matches the table's data lifecycle and common query patterns.**
+
+---
+
+# 10.9 Example: account_statements Partitioning
+
+A simplified table might look like:
+
+```sql
+CREATE TABLE account_statements (
+    id BIGINT NOT NULL,
+    account_id BIGINT NOT NULL,
+    transaction_id BIGINT,
+    amount DECIMAL(19,2),
+    balance DECIMAL(19,2),
+    statement_date DATE NOT NULL,
+    created_at TIMESTAMP NOT NULL
+);
+```
+
+A conceptual monthly RANGE partitioning strategy could be:
+
+```sql
+PARTITION BY RANGE COLUMNS (statement_date) (
+    PARTITION p202601 VALUES LESS THAN ('2026-02-01'),
+    PARTITION p202602 VALUES LESS THAN ('2026-03-01'),
+    PARTITION p202603 VALUES LESS THAN ('2026-04-01')
+);
+```
+
+This is an illustrative example showing the partitioning concept.
+
+The important point is:
+
+```text
+January Data
+      |
+      v
+p202601
+```
+
+```text
+February Data
+      |
+      v
+p202602
+```
+
+```text
+March Data
+      |
+      v
+p202603
+```
+
+The exact partition boundaries should be managed according to the final database schema and operational requirements.
+
+---
+
+# 10.10 How RANGE Partitioning Works
+
+Suppose MySQL receives:
+
+```text
+statement_date = 2026-02-15
+```
+
+The database evaluates the partition rules.
+
+Conceptually:
+
+```text
+2026-02-15
+     |
+     v
+Is it before 2026-02-01?
+     |
+     v
+No
+     |
+     v
+Is it before 2026-03-01?
+     |
+     v
+Yes
+     |
+     v
+Store in p202602
+```
+
+The application only executes:
+
+```text
+INSERT statement
+```
+
+The database handles partition placement.
+
+This is one reason partitioning is useful:
+
+```text
+Application
+     |
+     v
+Logical Table
+     |
+     v
+Database Handles Partition Placement
+```
+
+---
+
+# 10.11 Partition Pruning
+
+## What Is Partition Pruning?
+
+Partition pruning means MySQL can avoid scanning partitions that cannot contain the requested data.
+
+Consider this query:
+
+```sql
+SELECT *
+FROM account_statements
+WHERE statement_date >= '2026-02-01'
+  AND statement_date < '2026-03-01';
+```
+
+Without partitioning:
+
+```text
+Query
+ |
+ v
+Large Table
+ |
+ v
+Potentially Scan Large Amount of Data
+```
+
+With effective partition pruning:
+
+```text
+Query
+ |
+ v
+Identify Date Range
+ |
+ v
+Relevant Partition
+ |
+ v
+p202602
+```
+
+The database can focus on the relevant partition instead of considering unrelated partitions.
+
+Conceptually:
+
+```text
+Query: February 2026
+        |
+        v
++-----------------------------+
+| Jan | Feb | Mar | Apr | May |
++-----------------------------+
+       ^
+       |
+Only Relevant Partition
+```
+
+This can improve query efficiency when the partition key is used appropriately.
+
+---
+
+# 10.12 Important Limitation of Partition Pruning
+
+Partitioning does not automatically make every query faster.
+
+This is a very important interview point.
+
+Consider:
+
+```sql
+SELECT *
+FROM account_statements
+WHERE account_id = 100;
+```
+
+If the table is partitioned by:
+
+```text
+statement_date
+```
+
+but the query does not restrict the date:
+
+```text
+WHERE statement_date ...
+```
+
+MySQL may need to inspect multiple partitions.
+
+Conceptually:
+
+```text
+Query
+ |
+ v
+account_id = 100
+ |
+ v
+Date Unknown
+ |
+ +-----+-----+-----+
+ |     |     |     |
+ v     v     v     v
+Jan   Feb   Mar   Apr
+```
+
+Partition pruning is most effective when queries include conditions that match the partitioning key.
+
+Therefore:
+
+> **Partitioning strategy should be designed together with query patterns.**
+
+---
+
+# 10.13 Query Pattern Example
+
+A good partition-aware query:
+
+```sql
+SELECT *
+FROM account_statements
+WHERE account_id = 100
+  AND statement_date >= '2026-02-01'
+  AND statement_date < '2026-03-01';
+```
+
+The query contains:
+
+```text
+account_id
++
+statement_date range
+```
+
+This allows MySQL to identify the relevant partition and then use indexes inside that partition.
+
+Conceptually:
+
+```text
+Request
+   |
+   v
+Account ID = 100
+Date = February
+   |
+   v
+p202602
+   |
+   v
+Index Lookup
+   |
+   v
+Result
+```
+
+This is generally more aligned with a time-based partitioning strategy than a query that ignores the partition key.
+
+---
+
+# 10.14 Partitioning Does Not Replace Indexing
+
+This is another important concept.
+
+Some developers assume:
+
+```text
+Partitioning
+=
+No Need for Indexes
+```
+
+This is incorrect.
+
+Partitioning and indexing solve different problems.
+
+Partitioning helps determine:
+
+```text
+Which part of the table should be searched?
+```
+
+Indexes help determine:
+
+```text
+How should rows inside that partition be located efficiently?
+```
+
+Conceptually:
+
+```text
+Query
+ |
+ v
+Partition Pruning
+ |
+ v
+Relevant Partition
+ |
+ v
+Index Lookup
+ |
+ v
+Rows
+```
+
+A good design can use both.
+
+For example:
+
+```text
+Partition by:
+statement_date
+
+Index by:
+account_id
+```
+
+This can support:
+
+```text
+Account Statement Query
+       |
+       +---- Date Range
+       |
+       +---- Account ID
+```
+
+The exact indexes must still be chosen based on actual query patterns.
+
+---
+
+# 10.15 account_outbox Partitioning
+
+The CitiCore project uses the Transactional Outbox pattern for reliable event publishing.
+
+The general architecture is:
+
+```text
+Business Operation
+       |
+       v
+Database Transaction
+       |
+       +---------------------------+
+       |                           |
+       v                           v
+Business Data                 Outbox Event
+       |                           |
+       +------------+--------------+
+                    |
+                    v
+              Transaction Commit
+                    |
+                    v
+             Outbox Publisher
+                    |
+                    v
+                  Kafka
+```
+
+The outbox table can grow continuously because every important business event may create a record.
+
+For example:
+
+```text
+ACCOUNT_CREATED
+ACCOUNT_UPDATED
+ACCOUNT_DELETED
+ACCOUNT_TRANSACTION_CREATED
+```
+
+Over time:
+
+```text
+account_outbox
+       |
+       v
+Millions of Historical Events
+```
+
+A time-based partitioning strategy can help organize this data.
+
+Conceptually:
+
+```text
+account_outbox
+      |
+      +-----------------------------+
+      |             |               |
+      v             v               v
+ January         February         March
+ Events           Events          Events
+```
+
+---
+
+# 10.16 Why Partition the Outbox Table?
+
+The outbox table has a different lifecycle compared to a normal business table.
+
+An event usually follows a lifecycle such as:
+
+```text
+Created
+   |
+   v
+Pending
+   |
+   v
+Published
+   |
+   v
+Processed / Retained
+   |
+   v
+Archived or Removed
+```
+
+The table can accumulate a large number of processed events.
+
+Time-based partitions make lifecycle management easier.
+
+For example:
+
+```text
+Current Month
+     |
+     v
+Actively Used
+```
+
+and:
+
+```text
+Older Months
+     |
+     v
+Retention / Archive Candidate
+```
+
+Instead of deleting old records individually:
+
+```text
+DELETE
+FROM account_outbox
+WHERE created_at < old_date;
+```
+
+a partition-based approach can potentially manage old data more efficiently.
+
+---
+
+# 10.17 Dropping Old Partitions
+
+One major operational advantage of partitioning is retention management.
+
+Suppose:
+
+```text
+p202501
+p202502
+p202503
+...
+p202601
+```
+
+and the system no longer needs:
+
+```text
+p202501
+```
+
+Conceptually:
+
+```text
+DROP PARTITION p202501
+```
+
+The data associated with that partition can be removed as a partition operation instead of deleting rows individually.
+
+Conceptually:
+
+```text
+Without Partitioning
+
+DELETE millions of rows
+        |
+        v
+Large Delete Operation
+        |
+        v
+Locks / Load / Long Execution
+```
+
+Compared with:
+
+```text
+With Partitioning
+
+Drop Old Partition
+        |
+        v
+Remove Old Data Segment
+```
+
+This can simplify retention operations.
+
+However, dropping a partition permanently removes the data.
+
+Therefore production systems must ensure that:
+
+```text
+Backup
++
+Retention Policy
++
+Compliance Requirements
+```
+
+are considered before removing historical partitions.
+
+---
+
+# 10.18 Adding New Partitions
+
+A partitioned table requires future capacity planning.
+
+Suppose the current partitions are:
+
+```text
+January
+February
+March
+```
+
+Eventually the system reaches:
+
+```text
+April
+```
+
+A new partition may need to be created.
+
+Conceptually:
+
+```text
+Existing
+
+Jan | Feb | Mar
+
+New Data
+
+Apr
+```
+
+The partition structure must be extended.
+
+This means partition maintenance is not a one-time operation.
+
+It becomes an operational responsibility.
+
+A production process should ensure future partitions are created before new data reaches an uncovered range.
+
+Conceptually:
+
+```text
+Scheduler / DBA Process
+        |
+        v
+Check Future Partition Availability
+        |
+        v
+Create Next Partition
+```
+
+This can be automated in production.
+
+---
+
+# 10.19 Partition Maintenance
+
+Partitioning requires maintenance.
+
+A good operational process includes:
+
+```text
+Monitor
+   |
+   v
+Check Partition Ranges
+   |
+   v
+Create Future Partitions
+   |
+   v
+Archive Old Data
+   |
+   v
+Remove Expired Partitions
+```
+
+For CitiCore, maintenance would be particularly important for:
+
+```text
+account_statements
+```
+
+and:
+
+```text
+account_outbox
+```
+
+because both can continuously grow.
+
+A maintenance strategy should answer:
+
+* How far ahead are partitions created?
+* How long is data retained?
+* When is data archived?
+* When can old partitions be removed?
+* What backups exist before removal?
+
+---
+
+# 10.20 Partition Naming Strategy
+
+A clear naming strategy improves database maintenance.
+
+For monthly partitions:
+
+```text
+pYYYYMM
+```
+
+Examples:
+
+```text
+p202601
+p202602
+p202603
+```
+
+This is easy to understand.
+
+When an engineer sees:
+
+```text
+p202603
+```
+
+they immediately know:
+
+```text
+March 2026
+```
+
+The naming strategy should remain consistent.
+
+Avoid unclear names such as:
+
+```text
+partition1
+partition2
+partition3
+```
+
+because operational maintenance becomes more difficult.
+
+---
+
+# 10.21 Partition Boundaries
+
+Partition boundaries must be carefully defined.
+
+For example:
+
+```text
+p202601
+
+Values before:
+2026-02-01
+```
+
+This contains January data.
+
+The next partition:
+
+```text
+p202602
+
+Values before:
+2026-03-01
+```
+
+contains February data.
+
+Conceptually:
+
+```text
+January
+[2026-01-01, 2026-02-01)
+
+February
+[2026-02-01, 2026-03-01)
+
+March
+[2026-03-01, 2026-04-01)
+```
+
+The boundary design must avoid:
+
+```text
+Overlap
+```
+
+and:
+
+```text
+Missing Date Ranges
+```
+
+---
+
+# 10.22 Partitioning Flow in CitiCore
+
+Consider an account statement being generated.
+
+```text
+Customer Transaction
+        |
+        v
+Transaction Processing
+        |
+        v
+Account Statement Created
+        |
+        v
+account_statements
+        |
+        v
+Check statement_date
+        |
+        v
+Determine Partition
+        |
+        v
+Store Row
+```
+
+Example:
+
+```text
+statement_date
+=
+2026-02-15
+```
+
+Flow:
+
+```text
+2026-02-15
+      |
+      v
+Partition Rule
+      |
+      v
+February 2026
+      |
+      v
+p202602
+      |
+      v
+Row Stored
+```
+
+The application does not manually select the partition.
+
+MySQL manages the placement based on the partition definition.
+
+---
+
+# 10.23 Query Flow With Partition Pruning
+
+Consider a customer requesting statements for February.
+
+```text
+Client
+   |
+   v
+GET /statements?from=2026-02-01&to=2026-02-28
+   |
+   v
+Account Service
+   |
+   v
+Repository
+   |
+   v
+MySQL Query
+   |
+   v
+Partition Key Condition
+   |
+   v
+Partition Pruning
+   |
+   v
+Relevant Partition
+   |
+   v
+Result
+```
+
+Conceptually:
+
+```text
+All Partitions
+
+Jan | Feb | Mar | Apr
+
+Query = February
+
+     |
+     v
+
+    Feb
+```
+
+This is the main performance benefit expected from partition-aware queries.
+
+---
+
+# 10.24 Important MySQL Partitioning Rules
+
+Partitioning has important technical rules and limitations.
+
+The exact rules depend on the MySQL version and partitioning strategy, but several principles are important.
+
+---
+
+## Rule 1 — Partitioning Must Solve a Real Problem
+
+Do not partition simply because:
+
+```text
+Large Application
+```
+
+A table should be partitioned when there is a clear need.
+
+Examples:
+
+```text
+Very Large Historical Data
+Time-based Retention
+Time-based Queries
+Operational Cleanup Requirements
+```
+
+---
+
+## Rule 2 — Queries Should Align With the Partition Key
+
+Partitioning provides the greatest benefit when query patterns include the partition key.
+
+For example:
+
+```sql
+WHERE statement_date BETWEEN ...
+```
+
+is naturally aligned with time-based partitioning.
+
+A query that does not use the partition key may need to search multiple partitions.
+
+---
+
+## Rule 3 — Partitioning Does Not Replace Indexing
+
+Use appropriate indexes inside partitions.
+
+Conceptually:
+
+```text
+Partition
+    |
+    v
+Relevant Data Segment
+    |
+    v
+Indexes
+    |
+    v
+Efficient Row Lookup
+```
+
+---
+
+## Rule 4 — Partition Maintenance Is Required
+
+Future partitions must be planned.
+
+Old partitions must be managed according to retention requirements.
+
+Partitioning creates operational responsibilities.
+
+---
+
+## Rule 5 — Primary Key Design Must Be Considered
+
+MySQL partitioning has important restrictions around unique keys and partition columns.
+
+When designing a partitioned table, primary and unique key definitions must be validated against MySQL's partitioning requirements.
+
+This should be considered during schema design rather than discovered later during migration.
+
+---
+
+## Rule 6 — Avoid Excessive Partition Counts
+
+Creating too many partitions is not automatically better.
+
+For example:
+
+```text
+1 Partition Per Hour
+```
+
+for a long-running system could create unnecessary operational complexity.
+
+The partition size should balance:
+
+```text
+Query Pattern
++
+Data Growth
++
+Maintenance
++
+Operational Complexity
+```
+
+---
+
+# 10.25 Monthly vs Yearly Partitioning
+
+There is no universal answer for partition size.
+
+Consider monthly partitions:
+
+```text
+Jan
+Feb
+Mar
+Apr
+```
+
+### Advantages
+
+* Smaller partitions
+* More granular retention
+* Better for monthly date queries
+* Easier month-by-month cleanup
+
+### Disadvantages
+
+* More partitions
+* More maintenance
+
+Now consider yearly partitions:
+
+```text
+2025
+2026
+2027
+```
+
+### Advantages
+
+* Fewer partitions
+* Simpler maintenance
+
+### Disadvantages
+
+* Larger partitions
+* Less granular retention
+* Large yearly historical datasets
+
+The correct strategy depends on:
+
+```text
+Data Volume
++
+Growth Rate
++
+Query Pattern
++
+Retention Policy
+```
+
+For CitiCore's historical statement and outbox workloads, time-based RANGE partitioning is the core design concept. The final partition interval should be chosen based on actual data growth.
+
+---
+
+# 10.26 Partitioning and Database Replication
+
+Partitioning and replication solve different problems.
+
+Replication:
+
+```text
+Primary
+   |
+   v
+Replica
+```
+
+solves:
+
+```text
+Read Scalability
++
+Availability
+```
+
+Partitioning:
+
+```text
+Large Table
+   |
+   v
+Partitions
+```
+
+solves:
+
+```text
+Large Data Management
++
+Time-based Query Optimization
++
+Retention Operations
+```
+
+These concepts can work together.
+
+For example:
+
+```text
+Primary Database
+      |
+      v
+Partitioned account_statements
+      |
+      v
+Replicated
+      |
+      v
+Replica Database
+      |
+      v
+Read Queries
+```
+
+However:
+
+> **Replication does not replace partitioning, and partitioning does not replace replication.**
+
+They solve different architectural problems.
+
+---
+
+# 10.27 Partitioning and Read/Write Separation
+
+CitiCore also uses Primary/Replica routing.
+
+The relationship is:
+
+```text
+Primary / Replica
+       |
+       v
+Which Database?
+```
+
+Partitioning answers:
+
+```text
+Partitioning
+       |
+       v
+Which Data Segment?
+```
+
+A request can therefore involve both decisions.
+
+Example:
+
+```text
+Request Statement History
+          |
+          v
+Can use eventual consistency?
+          |
+          v
+Replica
+          |
+          v
+Date Range
+          |
+          v
+Partition Pruning
+          |
+          v
+Relevant Partition
+```
+
+This can be represented as:
+
+```text
+Client
+   |
+   v
+Account Service
+   |
+   v
+Datasource Routing
+   |
+   v
+Replica
+   |
+   v
+Partition Pruning
+   |
+   v
+Relevant Statement Partition
+```
+
+---
+
+# 10.28 Partitioning and Transactional Outbox
+
+The Transactional Outbox pattern and partitioning also solve different problems.
+
+Transactional Outbox:
+
+```text
+Reliable Event Creation
++
+Database Transaction
++
+Kafka Publishing
+```
+
+Partitioning:
+
+```text
+Manage Large Historical Outbox Data
+```
+
+Together:
+
+```text
+Business Transaction
+       |
+       v
+Business Data + Outbox Event
+       |
+       v
+Outbox Table
+       |
+       v
+Time-based Partition
+       |
+       v
+Outbox Publisher
+       |
+       v
+Kafka
+```
+
+The partitioning strategy does not guarantee event delivery.
+
+That responsibility belongs to the Transactional Outbox mechanism.
+
+Partitioning helps manage the growing outbox table.
+
+---
+
+# 10.29 Real Problem Addressed
+
+## Real Project Context
+
+The partitioning design addresses the expected growth of historical CitiCore tables.
+
+The two major concerns are:
+
+```text
+account_statements
+```
+
+and:
+
+```text
+account_outbox
+```
+
+Both tables can grow continuously.
+
+Without a data management strategy:
+
+```text
+Historical Records
+       |
+       v
+Table Growth
+       |
+       v
+Large Table
+       |
+       v
+Harder Queries
++
+Harder Cleanup
++
+Harder Retention Management
+```
+
+The CitiCore approach is to use time-based RANGE partitioning where it is appropriate.
+
+The partitioning strategy is particularly useful because both datasets have a natural time dimension.
+
+---
+
+# 10.30 Important Production Considerations
+
+## Partition Monitoring
+
+Monitor:
+
+```text
+Partition Count
+Partition Size
+Disk Usage
+Future Partition Availability
+Query Performance
+```
+
+---
+
+## Future Partition Creation
+
+A production system should avoid reaching a date range without a matching partition.
+
+Conceptually:
+
+```text
+Today
+   |
+   v
+Check Future Partitions
+   |
+   v
+Create Next Partition Before Needed
+```
+
+This can be automated.
+
+---
+
+## Retention Policy
+
+Before dropping partitions, define:
+
+```text
+How long is statement data retained?
+How long are outbox events retained?
+Are records archived?
+Are backups available?
+Are there regulatory requirements?
+```
+
+For a banking application, retention requirements may be particularly important.
+
+---
+
+## Backup
+
+Before removing historical partitions:
+
+```text
+Partition
+   |
+   v
+Backup / Archive Decision
+   |
+   v
+Retention Validation
+   |
+   v
+Drop Partition
+```
+
+Never treat partition dropping as a substitute for a proper data retention strategy.
+
+---
+
+## Query Monitoring
+
+Partition pruning should be verified rather than assumed.
+
+Useful tools include query analysis and execution plans.
+
+The goal is to confirm:
+
+```text
+Expected Partition
+       |
+       v
+Actually Used
+```
+
+---
+
+# 10.31 Trade-offs
+
+## Advantages
+
+### Better Management of Large Historical Tables
+
+```text
+Large Table
+    |
+    v
+Smaller Logical Segments
+```
+
+---
+
+### Partition Pruning
+
+Queries that include the partition key can search fewer partitions.
+
+---
+
+### Easier Data Retention
+
+Old partitions can be managed as logical data units.
+
+---
+
+### Better Operational Organization
+
+Time-based partitions make historical data easier to understand and maintain.
+
+---
+
+### Efficient Historical Data Management
+
+Partitioning is particularly suitable for:
+
+```text
+Statements
+Events
+Logs
+Historical Records
+```
+
+---
+
+## Disadvantages
+
+### Increased Schema Complexity
+
+Partitioning introduces additional database design decisions.
+
+---
+
+### Operational Maintenance
+
+Future partitions must be created.
+
+Old partitions must be managed.
+
+---
+
+### Query Dependency
+
+Queries that do not align with the partition key may not benefit significantly.
+
+---
+
+### More Careful Key Design
+
+Primary and unique key constraints must comply with MySQL partitioning requirements.
+
+---
+
+### Not Suitable for Every Table
+
+Using partitioning unnecessarily can make a system harder to maintain.
+
+---
+
+# 10.32 Alternatives to Partitioning
+
+## Archival Tables
+
+Old data can be moved to separate tables.
+
+Example:
+
+```text
+account_statements
+        |
+        v
+Current Data
+```
+
+and:
+
+```text
+account_statements_archive
+        |
+        v
+Old Data
+```
+
+### Advantage
+
+Simple conceptual separation.
+
+### Disadvantage
+
+Application queries may need to check multiple tables.
+
+---
+
+## Separate Database
+
+Historical data can be moved to another database.
+
+```text
+Operational Database
+        |
+        +---- Current Data
+        |
+        +---- Historical Database
+```
+
+This may be useful for very large systems but increases architectural complexity.
+
+---
+
+## Sharding
+
+Data can be distributed across multiple database instances.
+
+Example:
+
+```text
+Customer Range A
+       |
+       v
+Database 1
+
+Customer Range B
+       |
+       v
+Database 2
+```
+
+Sharding solves a different scaling problem and is significantly more complex than table partitioning.
+
+For CitiCore's identified historical tables, time-based RANGE partitioning is the more direct solution.
+
+---
+
+# 10.33 How I Would Explain This in an Interview
+
+> "In CitiCore, I used MySQL RANGE partitioning for tables that are expected to grow continuously and are naturally queried by time. The main candidates were account statements and the transactional outbox table.
+>
+> The idea was to divide large historical datasets into time-based partitions so that queries using date ranges could benefit from partition pruning. It also simplifies retention management because old data can be managed at the partition level instead of performing large row-by-row deletion operations.
+>
+> Partitioning does not replace indexes or replication. Replication handles read scaling and availability, while partitioning helps manage large datasets. We therefore use them for different concerns in the overall database architecture."
+
+---
+
+# 10.34 30-Second Interview Answer
+
+> "In CitiCore, I used MySQL RANGE partitioning for large time-based tables such as account statements and the outbox table. The data is organized by date ranges, allowing MySQL to use partition pruning when queries include the partition key. This helps manage large historical datasets and makes retention operations easier. I would still use proper indexes because partitioning and indexing solve different problems."
+
+---
+
+# 10.35 Interview Follow-up Questions
+
+## Q1. What is MySQL partitioning?
+
+**Answer:**
+
+MySQL partitioning divides one logical table into multiple physical partitions based on a partitioning rule. The application still queries the table normally, while MySQL manages where rows are stored.
+
+---
+
+## Q2. Why did you use RANGE partitioning?
+
+**Answer:**
+
+The CitiCore statement and outbox data have a natural time dimension. RANGE partitioning works well for date-based data and supports efficient time-range queries and retention management.
+
+---
+
+## Q3. What is partition pruning?
+
+**Answer:**
+
+Partition pruning is when MySQL identifies which partitions can contain the requested data and avoids scanning unrelated partitions.
+
+---
+
+## Q4. Does partitioning make every query faster?
+
+**Answer:**
+
+No. Queries benefit most when they include conditions related to the partition key. Queries that do not align with the partition key may need to access multiple partitions.
+
+---
+
+## Q5. Does partitioning replace indexing?
+
+**Answer:**
+
+No. Partitioning reduces the amount of table data that may need to be searched, while indexes help efficiently locate rows within the relevant partition.
+
+---
+
+## Q6. Why partition the account statements table?
+
+**Answer:**
+
+Account statements are historical and continuously growing. They are also commonly queried using date ranges, which makes time-based RANGE partitioning a suitable design.
+
+---
+
+## Q7. Why partition the outbox table?
+
+**Answer:**
+
+The outbox can continuously accumulate events. Time-based partitioning helps manage historical event data and supports retention and cleanup operations.
+
+---
+
+## Q8. What happens if you do not create future partitions?
+
+**Answer:**
+
+New rows may fail to be inserted if they do not match an available partition range, depending on the partition definition. Therefore future partition creation should be part of operational maintenance.
+
+---
+
+## Q9. What are the disadvantages of partitioning?
+
+**Answer:**
+
+It increases schema and operational complexity, requires maintenance, and does not improve every query. The partition strategy must match actual data and query patterns.
+
+---
+
+## Q10. How is partitioning different from sharding?
+
+**Answer:**
+
+Partitioning divides data inside a logical table according to a database partitioning strategy. Sharding distributes data across separate database instances. Sharding is generally a more complex distributed architecture.
+
+---
+
+# 10.36 Key Takeaways
+
+```text
+Large Historical Data
+        |
+        v
+Partitioning
+        |
+        v
+Time-based Partitions
+        |
+        +----------------------+
+        |                      |
+        v                      v
+Efficient Queries       Easier Retention
+```
+
+CitiCore candidates:
+
+```text
+account_statements
+        |
+        v
+Time-based RANGE Partitioning
+```
+
+and:
+
+```text
+account_outbox
+        |
+        v
+Time-based RANGE Partitioning
+```
+
+Query flow:
+
+```text
+Query
+   |
+   v
+Partition Key Condition
+   |
+   v
+Partition Pruning
+   |
+   v
+Relevant Partition
+   |
+   v
+Index Lookup
+   |
+   v
+Result
+```
+
+Most important principle:
+
+> **Partitioning should be used to solve a real data-growth and data-management problem. It is not a replacement for indexing, replication, or proper database design.**
+
+---
+
+# 10.37 Topic Summary
+
+CitiCore uses MySQL partitioning as part of its strategy for managing large, time-oriented historical data.
+
+The main design focus is:
+
+```text
+Historical Data
+      +
+Continuous Growth
+      +
+Time-based Queries
+      +
+Retention Requirements
+```
+
+The identified tables include:
+
+```text
+account_statements
+```
+
+and:
+
+```text
+account_outbox
+```
+
+The core approach is:
+
+```text
+RANGE Partitioning
+        |
+        v
+Time-based Data Segmentation
+```
+
+The expected benefits are:
+
+```text
+Partition Pruning
++
+Historical Data Management
++
+Simpler Retention Operations
++
+Better Organization of Large Tables
+```
+
+The most important technical principle is:
+
+> **Choose the partition key based on actual data lifecycle and query patterns. Partitioning provides the greatest value when application queries align with the partitioning strategy.**
+
+---
+# Topic 11 - Database Security
+
+# 11.1 Overview
+
+Database security in CitiCore is not limited to protecting a database username and password.
+
+A banking application stores sensitive information such as:
+
+* User information
+* Account details
+* Transaction records
+* KYC-related data
+* Authentication-related data
+* Financial history
+* Internal system events
+
+Therefore, database security must protect multiple layers:
+
+```text
+Application
+     |
+     v
+Database Credentials
+     |
+     v
+Network Access
+     |
+     v
+Encrypted Connection
+     |
+     v
+Database Permissions
+     |
+     v
+Sensitive Data
+```
+
+The main database security concerns for CitiCore are:
+
+* Who can connect to the database?
+* Which network locations can access it?
+* Which database operations can each user perform?
+* Are credentials stored securely?
+* Is communication between the application and database encrypted?
+* How are database credentials rotated?
+* How are read-only and write operations separated?
+* How does the application verify the database server identity?
+
+The major concepts covered in this topic are:
+
+1. Database users
+2. Least privilege
+3. Read-only users
+4. TLS/SSL
+5. AWS RDS CA certificates
+6. Java truststores
+7. `VERIFY_IDENTITY`
+8. AWS Secrets Manager
+9. Credential management
+
+---
+
+# 11.2 Security Architecture
+
+A simplified CitiCore production database connection looks like:
+
+```text
+Spring Boot Service
+        |
+        |  Database Credentials
+        |  Retrieved Securely
+        v
+AWS Secrets Manager
+        |
+        v
+Spring Boot Application
+        |
+        | TLS/SSL Encrypted Connection
+        | Database Server Identity Verified
+        v
+AWS RDS MySQL
+        |
+        v
+Database User Permissions
+        |
+        +----------------------+
+        |                      |
+        v                      v
+Read Operations         Write Operations
+```
+
+Network security is also involved:
+
+```text
+Internet
+    |
+    X
+    |
+No Direct Database Access
+```
+
+Instead:
+
+```text
+ECS / Application
+       |
+       | Allowed Security Group Rule
+       v
+Private RDS Database
+```
+
+The complete security model therefore includes:
+
+```text
+Identity
++
+Credentials
++
+Network Security
++
+Encryption
++
+Authorization
+```
+
+---
+
+# 11.3 Database Users
+
+## 1. What Is It?
+
+A database user is an identity used to authenticate with the database.
+
+For example:
+
+```text
+Username: citicore_app
+Password: ********
+```
+
+The database verifies:
+
+```text
+Who is connecting?
+```
+
+After authentication, the database checks:
+
+```text
+What is this user allowed to do?
+```
+
+These are two separate concerns.
+
+```text
+Authentication
+       |
+       v
+Who are you?
+```
+
+```text
+Authorization
+       |
+       v
+What are you allowed to do?
+```
+
+---
+
+# 11.4 Why Do We Need Different Database Users?
+
+A common security mistake is to use one highly privileged database user everywhere.
+
+For example:
+
+```text
+Application
+      |
+      v
+Database Admin User
+      |
+      v
+SELECT
+INSERT
+UPDATE
+DELETE
+CREATE
+DROP
+ALTER
+```
+
+This is dangerous.
+
+If application credentials are compromised, an attacker may receive unnecessary permissions.
+
+For example:
+
+```text
+Compromised Application Credential
+              |
+              v
+Highly Privileged Database User
+              |
+              v
+DROP DATABASE
+```
+
+The better approach is to provide only the permissions required for a specific responsibility.
+
+This is called:
+
+> **Principle of Least Privilege**
+
+---
+
+# 11.5 Principle of Least Privilege
+
+## Concept
+
+The principle of least privilege means:
+
+> A user, service, or system should receive only the minimum permissions required to perform its job.
+
+For example:
+
+```text
+Notification Service
+```
+
+does not necessarily need permission to:
+
+```text
+DROP TABLE
+```
+
+Similarly, a read-only reporting process should not have:
+
+```text
+INSERT
+UPDATE
+DELETE
+```
+
+permissions.
+
+Instead:
+
+```text
+Read User
+    |
+    +---- SELECT
+```
+
+```text
+Write User
+    |
+    +---- SELECT
+    +---- INSERT
+    +---- UPDATE
+    +---- DELETE
+```
+
+Administrative users should be separated from application users.
+
+---
+
+# 11.6 CitiCore Context
+
+## CitiCore Implementation
+
+CitiCore's database architecture includes read/write separation between:
+
+```text
+Primary Database
+```
+
+and:
+
+```text
+Read Replica
+```
+
+This architecture naturally supports the idea of separate database access responsibilities.
+
+Conceptually:
+
+```text
+Spring Boot Service
+       |
+       +----------------------+
+       |                      |
+       v                      v
+Write Datasource        Read Datasource
+       |                      |
+       v                      v
+Primary DB             Replica DB
+```
+
+A production-ready implementation should also ensure that database credentials follow the same separation of responsibility.
+
+For example:
+
+```text
+Application Write Access
+        |
+        v
+Primary Database
+```
+
+and:
+
+```text
+Application Read Access
+        |
+        v
+Replica Database
+```
+
+The important principle is that read operations should not receive unnecessary administrative permissions.
+
+---
+
+# 11.7 Read-Only Database Users
+
+## What Is a Read-Only User?
+
+A read-only database user is allowed to retrieve data but cannot modify it.
+
+Conceptually:
+
+```text
+Read-Only User
+      |
+      +---- SELECT  ✓
+      |
+      +---- INSERT  ✗
+      |
+      +---- UPDATE  ✗
+      |
+      +---- DELETE  ✗
+```
+
+Example MySQL permission:
+
+```sql
+GRANT SELECT ON citicore_db.* TO 'citicore_readonly'@'%';
+```
+
+This is an example of the concept. The exact user and host restrictions should be defined according to the production network architecture.
+
+---
+
+# 11.8 Why Use Read-Only Users?
+
+Read-only credentials provide an additional security layer.
+
+Suppose a reporting service only needs:
+
+```text
+Transaction History
+Account Statements
+Customer Information
+```
+
+It should not require permission to modify data.
+
+If that service is compromised:
+
+```text
+Compromised Read Credential
+         |
+         v
+Can Read Data
+         |
+         X
+Cannot Modify Data
+```
+
+This limits the possible impact.
+
+This approach is especially useful when:
+
+* Applications have different responsibilities
+* Reporting workloads exist
+* Read replicas are used
+* Analytics services access production data
+* Internal tools need limited access
+
+---
+
+# 11.9 Application Database User
+
+A normal application database user may require:
+
+```text
+SELECT
+INSERT
+UPDATE
+DELETE
+```
+
+depending on the application's responsibility.
+
+For example:
+
+```text
+Account Service
+      |
+      v
+Accounts Database Operations
+```
+
+The permissions should be restricted to:
+
+```text
+Required Database
++
+Required Tables
++
+Required Operations
+```
+
+The application user should generally not receive unnecessary administrative permissions such as:
+
+```text
+DROP DATABASE
+CREATE USER
+GRANT
+SUPER
+```
+
+unless there is a specific operational requirement.
+
+---
+
+# 11.10 Database Security Layers
+
+A secure CitiCore database connection should be viewed as multiple layers.
+
+```text
+Layer 1
+Identity
+```
+
+Who is connecting?
+
+```text
+Layer 2
+Credentials
+```
+
+Is the username and password valid?
+
+```text
+Layer 3
+Network
+```
+
+Is the connection coming from an allowed network location?
+
+```text
+Layer 4
+TLS
+```
+
+Is communication encrypted?
+
+```text
+Layer 5
+Server Verification
+```
+
+Is the application connected to the correct database server?
+
+```text
+Layer 6
+Authorization
+```
+
+What database operations are allowed?
+
+Together:
+
+```text
+Application
+     |
+     v
+Authentication
+     |
+     v
+Authorization
+     |
+     v
+Network Control
+     |
+     v
+TLS Encryption
+     |
+     v
+Database
+```
+
+No single layer should be considered sufficient by itself.
+
+---
+
+# 11.11 TLS/SSL for Database Connections
+
+## 1. What Is TLS?
+
+TLS, previously commonly referred to as SSL, encrypts communication between two systems.
+
+For CitiCore:
+
+```text
+Spring Boot Application
+          |
+          | Plain Text
+          X
+          |
+          | TLS Encrypted
+          v
+AWS RDS MySQL
+```
+
+Without encryption, database communication may expose sensitive information if the network is compromised.
+
+The encrypted connection protects data in transit.
+
+This can include:
+
+* SQL queries
+* Query results
+* User data
+* Transaction information
+* Database credentials during authentication
+
+---
+
+# 11.12 Why Database TLS Is Important
+
+Consider a database request:
+
+```text
+Application
+      |
+      v
+SELECT account details
+      |
+      v
+Database
+```
+
+Without TLS:
+
+```text
+Application
+      |
+      | Unencrypted Network Traffic
+      v
+Database
+```
+
+With TLS:
+
+```text
+Application
+      |
+      |===========================|
+      |   Encrypted TLS Traffic   |
+      |===========================|
+      v
+Database
+```
+
+For a banking platform, sensitive information should not depend only on network isolation.
+
+Defense in depth is preferred.
+
+That means:
+
+```text
+Private Network
++
+Security Groups
++
+TLS Encryption
+```
+
+instead of relying on only one security mechanism.
+
+---
+
+# 11.13 CitiCore Context: AWS RDS TLS
+
+## CitiCore Implementation
+
+The CitiCore database deployment includes AWS RDS.
+
+AWS provides certificate authority information used for secure database connections.
+
+Conceptually:
+
+```text
+Spring Boot Application
+        |
+        | TLS Connection
+        v
+AWS RDS Endpoint
+        |
+        v
+RDS Certificate
+        |
+        v
+AWS Certificate Authority
+```
+
+The Java application must trust the certificate authority used to validate the RDS database certificate.
+
+This requires:
+
+```text
+AWS RDS CA Certificate
+        |
+        v
+Java Truststore
+        |
+        v
+JDBC Connection
+```
+
+---
+
+# 11.14 AWS RDS Certificate Authority
+
+## What Is a Certificate Authority?
+
+A Certificate Authority, or CA, is responsible for issuing and signing certificates.
+
+The application needs to determine:
+
+```text
+Can I trust this database certificate?
+```
+
+The answer is based on trusted certificate authorities.
+
+Conceptually:
+
+```text
+Application
+     |
+     v
+Database Certificate
+     |
+     v
+Issued / Signed By
+     |
+     v
+Trusted Certificate Authority?
+     |
+     +--------+
+     |        |
+    Yes       No
+     |        |
+     v        v
+Connect     Reject
+```
+
+For AWS RDS, AWS provides CA certificate bundles and certificate information that applications can use to establish trust.
+
+---
+
+# 11.15 Java Truststore
+
+## What Is a Truststore?
+
+A Java truststore is a repository containing certificates that Java applications trust.
+
+Conceptually:
+
+```text
+Java Application
+       |
+       v
+Truststore
+       |
+       +--------------------+
+       |                    |
+       v                    v
+Trusted CA 1          Trusted CA 2
+```
+
+When connecting to an RDS database over TLS:
+
+```text
+Spring Boot
+     |
+     v
+Receive Database Certificate
+     |
+     v
+Check Java Truststore
+     |
+     v
+Trusted CA Available?
+     |
+     +--------+
+     |        |
+    Yes       No
+     |        |
+     v        v
+Connect     TLS Failure
+```
+
+---
+
+# 11.16 Why CitiCore Needs a Truststore
+
+The application should not blindly accept any database certificate.
+
+Otherwise, a malicious or incorrectly configured server could potentially be trusted.
+
+The truststore allows the application to verify that the certificate presented by the database is issued by a trusted authority.
+
+The flow is:
+
+```text
+Spring Boot Application
+        |
+        v
+Connect to RDS
+        |
+        v
+RDS Presents Certificate
+        |
+        v
+Java Checks Truststore
+        |
+        v
+Trusted CA?
+        |
+        +----------+
+        |          |
+       Yes         No
+        |          |
+        v          v
+Continue       Reject Connection
+```
+
+---
+
+# 11.17 Truststore Creation
+
+A common approach involves importing the appropriate RDS CA certificate into a Java truststore.
+
+Conceptually:
+
+```text
+AWS RDS CA Certificate
+         |
+         v
+keytool
+         |
+         v
+Java Truststore
+```
+
+A command may look similar to:
+
+```bash
+keytool -importcert \
+  -alias aws-rds-ca \
+  -file rds-ca.pem \
+  -keystore truststore.jks
+```
+
+This is a representative example of the process.
+
+The exact certificate file, alias, keystore format, and password must match the AWS RDS certificate configuration being used.
+
+The truststore should be handled securely.
+
+For example:
+
+```text
+truststore.jks
+      |
+      +---- Do not expose passwords in source code
+      |
+      +---- Use secure deployment configuration
+      |
+      +---- Manage certificate updates
+```
+
+---
+
+# 11.18 SSL Modes
+
+Database drivers can support different SSL verification modes.
+
+One important production concept is:
+
+```text
+VERIFY_IDENTITY
+```
+
+The exact JDBC configuration depends on the MySQL connector and connection configuration.
+
+The key security principle is:
+
+> The application should not only encrypt the connection. It should also verify the identity of the database server.
+
+---
+
+# 11.19 VERIFY_IDENTITY
+
+## What Is VERIFY_IDENTITY?
+
+`VERIFY_IDENTITY` provides stronger certificate validation than simply enabling encryption.
+
+Conceptually:
+
+```text
+Application
+     |
+     v
+Database Server
+     |
+     v
+Certificate Presented
+     |
+     +--------------------------+
+     |                          |
+     v                          v
+Certificate Trusted?      Hostname Matches?
+     |                          |
+     +------------+-------------+
+                  |
+                  v
+            Secure Connection
+```
+
+The application verifies:
+
+1. The certificate chain is trusted.
+2. The server identity matches the expected host.
+
+This helps protect against connecting to an unexpected or impersonated server.
+
+---
+
+# 11.20 Why Encryption Alone Is Not Enough
+
+Consider this scenario:
+
+```text
+Application
+     |
+     v
+Encrypted Connection
+     |
+     v
+Unknown Server
+```
+
+The connection may be encrypted, but encryption alone does not necessarily prove that the application connected to the intended server.
+
+A stronger security model is:
+
+```text
+Encrypted Connection
+       +
+Trusted Certificate
+       +
+Server Identity Verification
+```
+
+This provides better protection.
+
+---
+
+# 11.21 JDBC Connection Security
+
+A conceptual secure connection configuration includes:
+
+```text
+JDBC URL
+   |
+   +---- TLS Enabled
+   |
+   +---- Certificate Verification
+   |
+   +---- Server Identity Verification
+```
+
+For example, depending on the MySQL driver version and configuration:
+
+```properties
+useSSL=true
+```
+
+and certificate verification settings may be configured.
+
+However, production configuration should be based on the exact:
+
+* MySQL Connector/J version
+* AWS RDS certificate configuration
+* Deployment environment
+* Java version
+
+The important CitiCore design principle is:
+
+> Database connections should use encryption and certificate validation rather than disabling certificate verification for convenience.
+
+---
+
+# 11.22 Development vs Production TLS
+
+Development environments are different from production environments.
+
+Local development might use:
+
+```text
+Docker MySQL
+      |
+      v
+Local Network
+```
+
+Production uses:
+
+```text
+Spring Boot Service
+       |
+       | TLS
+       v
+AWS RDS
+```
+
+The security requirements are therefore different.
+
+A local development environment may simplify configuration.
+
+Production should enforce stronger controls:
+
+```text
+Private Database
++
+Restricted Network Access
++
+TLS
++
+Certificate Validation
++
+Secure Credentials
+```
+
+A common mistake is copying relaxed local security settings into production.
+
+CitiCore documentation should clearly distinguish:
+
+```text
+Local Development Configuration
+```
+
+from:
+
+```text
+Production Security Configuration
+```
+
+---
+
+# 11.23 AWS Secrets Manager
+
+## 1. What Is It?
+
+AWS Secrets Manager is a service used to securely store and manage secrets.
+
+Examples include:
+
+```text
+Database Username
+Database Password
+API Keys
+Tokens
+Certificates
+```
+
+Instead of storing credentials directly in source code:
+
+```java
+String password = "my-database-password";
+```
+
+the application retrieves the secret securely.
+
+Conceptually:
+
+```text
+Spring Boot Application
+        |
+        v
+AWS Secrets Manager
+        |
+        v
+Database Credentials
+        |
+        v
+AWS RDS
+```
+
+---
+
+# 11.24 Why Secrets Manager Is Needed
+
+Hardcoding credentials creates multiple risks.
+
+Example:
+
+```text
+Source Code
+    |
+    +---- Database Password
+```
+
+Problems include:
+
+* Credentials can be committed to Git
+* Credentials can be exposed in logs
+* Password rotation becomes difficult
+* Different environments require different credentials
+* Developers may accidentally share secrets
+
+A better architecture is:
+
+```text
+Application Code
+       |
+       X
+No Hardcoded Secret
+```
+
+Instead:
+
+```text
+Application
+      |
+      v
+Secure Secret Provider
+      |
+      v
+Credential
+```
+
+---
+
+# 11.25 CitiCore Context: Credential Management
+
+## CitiCore Implementation
+
+The CitiCore AWS architecture includes the use of secure AWS infrastructure components for deployment.
+
+For production database access, secrets should not be stored directly inside:
+
+```text
+application.yml
+```
+
+or:
+
+```text
+Dockerfile
+```
+
+or:
+
+```text
+Jenkinsfile
+```
+
+Instead:
+
+```text
+AWS Secrets Manager
+        |
+        v
+ECS Task / Application
+        |
+        v
+Database Credentials
+```
+
+This provides better separation between:
+
+```text
+Application Configuration
+```
+
+and:
+
+```text
+Sensitive Credentials
+```
+
+---
+
+# 11.26 Secrets Flow
+
+The production flow can be represented as:
+
+```text
+Developer
+    |
+    v
+Creates Application
+    |
+    v
+No Password in Source Code
+    |
+    v
+Deploy Application
+    |
+    v
+ECS Task Starts
+    |
+    v
+IAM Permission
+    |
+    v
+AWS Secrets Manager
+    |
+    v
+Retrieve Database Secret
+    |
+    v
+Application Connects to RDS
+```
+
+The application should receive permission to access only the secrets it needs.
+
+This follows the same least-privilege principle used for database users.
+
+---
+
+# 11.27 IAM and Secrets Access
+
+AWS IAM controls who or what can access a secret.
+
+For CitiCore:
+
+```text
+ECS Task
+    |
+    v
+IAM Task Role
+    |
+    v
+Permission Check
+    |
+    v
+AWS Secrets Manager
+```
+
+The task role should be limited to:
+
+```text
+Required Secret
+```
+
+rather than:
+
+```text
+All Secrets
+```
+
+Conceptually:
+
+```text
+CitiCore Account Service
+          |
+          v
+IAM Role
+          |
+          v
+Can Access:
+account-service-db-secret
+
+Cannot Access:
+other-unrelated-secret
+```
+
+This limits the impact of a compromised service.
+
+---
+
+# 11.28 Credential Rotation
+
+Passwords should not be permanent.
+
+A secure production system should support credential rotation.
+
+Conceptually:
+
+```text
+Old Credential
+      |
+      v
+Rotate
+      |
+      v
+New Credential
+      |
+      v
+Application Uses Updated Credential
+```
+
+AWS Secrets Manager can support secret rotation workflows.
+
+However, rotation must be carefully integrated with:
+
+```text
+Application Connection Pool
++
+Deployment Configuration
++
+Database Users
+```
+
+If the database password changes but the application continues using an old password:
+
+```text
+Application
+      |
+      v
+Old Password
+      |
+      v
+Authentication Failure
+```
+
+Therefore credential rotation must be treated as an operational process rather than simply changing a password.
+
+---
+
+# 11.29 HikariCP and Credential Rotation
+
+CitiCore uses Spring Boot database connectivity, where HikariCP is relevant to connection pooling.
+
+Conceptually:
+
+```text
+Application
+     |
+     v
+HikariCP
+     |
+     +---- Connection 1
+     +---- Connection 2
+     +---- Connection 3
+     |
+     v
+Database
+```
+
+When credentials rotate, existing connections may continue to exist until they are refreshed or recreated.
+
+Production credential rotation therefore needs to consider:
+
+```text
+Secret Rotation
+       |
+       v
+Application Configuration Refresh
+       |
+       v
+Connection Pool Refresh
+       |
+       v
+New Database Connections
+```
+
+The exact implementation depends on how credentials are injected into the application and how configuration refresh is handled.
+
+---
+
+# 11.30 Do Not Store Secrets in application.yml
+
+A configuration file such as:
+
+```yaml
+spring:
+  datasource:
+    username: admin
+    password: my-password
+```
+
+may be acceptable only as a local development example when the file is excluded from version control and managed appropriately.
+
+For production, the preferred architecture is:
+
+```text
+application.yml
+       |
+       +---- Database Endpoint
+       +---- Non-sensitive Configuration
+```
+
+Sensitive values should come from:
+
+```text
+AWS Secrets Manager
+```
+
+or another approved secure secret management mechanism.
+
+---
+
+# 11.31 Environment Variables and Secrets
+
+Environment variables are commonly used in containerized applications.
+
+Example:
+
+```text
+DB_USERNAME
+DB_PASSWORD
+```
+
+This can be useful, but environment variables also require careful handling.
+
+Risks include:
+
+* Accidental logging
+* Exposure through debugging tools
+* Exposure through container inspection
+* Misconfigured CI/CD pipelines
+
+A more secure container deployment architecture is:
+
+```text
+AWS Secrets Manager
+        |
+        v
+ECS Secret Injection
+        |
+        v
+Container Environment
+        |
+        v
+Spring Boot Application
+```
+
+The secret value should never be printed in logs.
+
+---
+
+# 11.32 Secrets and Jenkins
+
+Jenkins pipelines may require access to infrastructure credentials.
+
+For example:
+
+```text
+Git
+AWS
+Docker
+ECR
+```
+
+Database credentials should not be placed directly inside:
+
+```groovy
+Jenkinsfile
+```
+
+For example, avoid:
+
+```groovy
+environment {
+    DB_PASSWORD = "secret-password"
+}
+```
+
+Instead, use secure credential management.
+
+Conceptually:
+
+```text
+Jenkins Pipeline
+       |
+       v
+Credential Store / Secure Secret Provider
+       |
+       v
+Temporary Secure Access
+```
+
+The same principle applies across:
+
+```text
+Source Code
+Docker
+Jenkins
+AWS
+Spring Boot
+```
+
+---
+
+# 11.33 Network Security
+
+Database credentials alone are not sufficient.
+
+The database should also be protected by network controls.
+
+For CitiCore AWS architecture:
+
+```text
+Internet
+    |
+    X
+    |
+RDS Not Directly Accessible
+```
+
+Instead:
+
+```text
+ECS Service
+    |
+    | Allowed Database Port
+    v
+Security Group
+    |
+    v
+RDS Security Group
+    |
+    v
+RDS MySQL
+```
+
+The database should typically be located in a private subnet.
+
+Conceptually:
+
+```text
+VPC
+ |
+ +------------------------+
+ |                        |
+ | Public Subnet          |
+ |     |                  |
+ |    ALB                 |
+ |     |                  |
+ | Private Subnet         |
+ |     |                  |
+ |    ECS                 |
+ |     |                  |
+ | Database Subnet        |
+ |     |                  |
+ |    RDS                 |
+ |                        |
+ +------------------------+
+```
+
+This reduces unnecessary exposure.
+
+---
+
+# 11.34 Security Groups and Database Access
+
+A security group should allow database traffic only from trusted sources.
+
+Conceptually:
+
+```text
+RDS Security Group
+       |
+       +---- Allow MySQL
+       |
+       +---- Source:
+              ECS Service Security Group
+```
+
+Avoid:
+
+```text
+MySQL Port
+3306
+Source
+0.0.0.0/0
+```
+
+because that would unnecessarily expose the database.
+
+The better model is:
+
+```text
+Only Trusted Application
+          |
+          v
+Can Reach Database
+```
+
+---
+
+# 11.35 Database Access Flow
+
+A secure CitiCore database connection can be summarized as:
+
+```text
+Client Request
+      |
+      v
+API Gateway
+      |
+      v
+Spring Boot Service
+      |
+      +--------------------------+
+      |                          |
+      v                          v
+IAM Role                  Database Configuration
+      |                          |
+      v                          v
+Secrets Manager          RDS Endpoint
+      |                          |
+      +------------+-------------+
+                   |
+                   v
+            HikariCP Pool
+                   |
+                   v
+         TLS Encrypted Connection
+                   |
+                   v
+            RDS Security Group
+                   |
+                   v
+              AWS RDS
+                   |
+                   v
+          Database Authorization
+```
+
+Each layer protects a different part of the connection.
+
+---
+
+# 11.36 Database Authorization Flow
+
+After the application successfully connects:
+
+```text
+Application
+     |
+     v
+Database Username
+     |
+     v
+Authentication
+     |
+     v
+Permission Check
+     |
+     +------------------------+
+     |                        |
+     v                        v
+Allowed                  Not Allowed
+     |                        |
+     v                        v
+Execute Query             Reject Query
+```
+
+For example:
+
+```text
+Read-Only User
+      |
+      v
+SELECT
+      |
+      ✓
+```
+
+but:
+
+```text
+Read-Only User
+      |
+      v
+DELETE
+      |
+      ✗
+```
+
+This is why database authorization remains important even when application-level security exists.
+
+---
+
+# 11.37 Defense in Depth
+
+CitiCore should not depend on one security control.
+
+Instead:
+
+```text
+Layer 1
+Private Network
+```
+
+```text
+Layer 2
+Security Groups
+```
+
+```text
+Layer 3
+Database Credentials
+```
+
+```text
+Layer 4
+Least Privilege
+```
+
+```text
+Layer 5
+TLS Encryption
+```
+
+```text
+Layer 6
+Certificate Verification
+```
+
+```text
+Layer 7
+Secrets Management
+```
+
+Together:
+
+```text
++-----------------------------+
+| Application Security        |
++-----------------------------+
+              |
++-----------------------------+
+| IAM Permissions             |
++-----------------------------+
+              |
++-----------------------------+
+| Secrets Manager             |
++-----------------------------+
+              |
++-----------------------------+
+| TLS / Certificate Validation|
++-----------------------------+
+              |
++-----------------------------+
+| Security Groups             |
++-----------------------------+
+              |
++-----------------------------+
+| Database Permissions        |
++-----------------------------+
+```
+
+If one control fails, other controls still provide protection.
+
+---
+
+# 11.38 Common Database Security Mistakes
+
+## Mistake 1 — Hardcoding Passwords
+
+```java
+String password = "database-password";
+```
+
+### Problem
+
+Credentials can be exposed through source control.
+
+### Better Approach
+
+```text
+Secrets Manager
+```
+
+---
+
+## Mistake 2 — Using Root Credentials
+
+```text
+Application
+     |
+     v
+Database Root User
+```
+
+### Problem
+
+The application receives excessive permissions.
+
+### Better Approach
+
+```text
+Dedicated Application User
++
+Least Privilege
+```
+
+---
+
+## Mistake 3 — Publicly Accessible Database
+
+```text
+Internet
+    |
+    v
+RDS
+```
+
+### Problem
+
+The attack surface is unnecessarily large.
+
+### Better Approach
+
+```text
+Private RDS
+    |
+    v
+Application Security Group Only
+```
+
+---
+
+## Mistake 4 — Disabling Certificate Verification
+
+A configuration that accepts any certificate may appear convenient during development.
+
+### Problem
+
+The application may not properly verify the database server identity.
+
+### Better Approach
+
+```text
+TLS
++
+Trusted CA
++
+Identity Verification
+```
+
+---
+
+## Mistake 5 — Logging Secrets
+
+Never log:
+
+```text
+Passwords
+Tokens
+Secret Values
+Database Connection Secrets
+```
+
+Even debugging logs can become a security problem.
+
+---
+
+# 11.39 Real Project Context
+
+The CitiCore notes include database deployment and security work involving AWS RDS and secure database connectivity.
+
+Important implementation areas include:
+
+* RDS database access
+* Primary/Replica database architecture
+* Application datasource configuration
+* AWS security configuration
+* TLS/SSL database connectivity
+* AWS RDS CA certificates
+* Java truststore configuration
+* Database credential management
+
+The authoritative design principle is:
+
+> CitiCore database connectivity should be protected using network isolation, restricted access, encrypted communication, certificate verification, and secure credential management.
+
+This topic should not be confused with the earlier **Database Architecture** topic.
+
+Database Architecture explains:
+
+```text
+How data is stored and accessed.
+```
+
+Database Security explains:
+
+```text
+How database access and communication are protected.
+```
+
+---
+
+# 11.40 Production Considerations
+
+A real production banking system would require additional security controls.
+
+---
+
+## Credential Rotation
+
+Database credentials should support periodic rotation.
+
+---
+
+## Audit Logging
+
+Important database activities should be monitored.
+
+Examples:
+
+```text
+Failed Login Attempts
+Permission Changes
+Administrative Operations
+Unexpected Connections
+```
+
+---
+
+## Encryption at Rest
+
+TLS protects:
+
+```text
+Data in Transit
+```
+
+Production databases should also consider encryption for:
+
+```text
+Data at Rest
+```
+
+For AWS RDS, this involves appropriate encryption configuration using AWS-managed or customer-managed keys depending on requirements.
+
+---
+
+## Separate Environment Credentials
+
+Never reuse the same credentials across:
+
+```text
+Development
+Testing
+Staging
+Production
+```
+
+Each environment should have separate secrets and access policies.
+
+---
+
+## Secret Access Monitoring
+
+Monitor:
+
+```text
+Who accessed secrets?
+When were secrets accessed?
+Which application role accessed them?
+```
+
+AWS services such as CloudTrail can support auditing of AWS API activity.
+
+---
+
+## Certificate Rotation
+
+RDS certificate authorities and server certificates can change over time.
+
+Applications must ensure that:
+
+```text
+Truststore
+```
+
+and:
+
+```text
+Certificate Configuration
+```
+
+remain compatible with supported AWS RDS certificate rotations.
+
+---
+
+# 11.41 Trade-offs
+
+## Dedicated Database Users
+
+### Advantages
+
+* Reduced security risk
+* Better separation of responsibility
+* Easier auditing
+
+### Disadvantages
+
+* More users and permissions to manage
+
+---
+
+## Read-Only Users
+
+### Advantages
+
+* Limits accidental modification
+* Reduces impact of compromised credentials
+* Supports read-specific workloads
+
+### Disadvantages
+
+* Requires separate credential management
+
+---
+
+## TLS
+
+### Advantages
+
+* Encrypts data in transit
+* Protects sensitive database communication
+
+### Disadvantages
+
+* Certificate management
+* Additional configuration complexity
+
+---
+
+## Certificate Identity Verification
+
+### Advantages
+
+* Stronger server validation
+* Protection against incorrect server connections
+
+### Disadvantages
+
+* Requires proper CA and hostname configuration
+
+---
+
+## AWS Secrets Manager
+
+### Advantages
+
+* No hardcoded credentials
+* Centralized secret management
+* Supports rotation workflows
+
+### Disadvantages
+
+* Additional AWS service dependency
+* IAM configuration is required
+* Application deployment must handle secret retrieval correctly
+
+---
+
+# 11.42 How I Would Explain This in an Interview
+
+> "For database security in CitiCore, I focused on multiple layers rather than relying only on a username and password. The database is protected through restricted network access, dedicated database users, least-privilege permissions, and TLS encryption.
+>
+> For AWS RDS connectivity, the Java application uses certificate trust configuration so that the application can validate the database certificate instead of blindly trusting the server. Sensitive credentials should be stored outside the application source code using AWS Secrets Manager and accessed through IAM permissions.
+>
+> Since CitiCore uses primary-replica architecture, database access responsibilities can also be separated between read and write workloads. The main principle was defense in depth: network security, IAM, secrets management, encryption, certificate validation, and database authorization all work together."
+
+---
+
+# 11.43 30-Second Interview Answer
+
+> "In CitiCore, database security is based on defense in depth. We restrict database access through private networking and security groups, use dedicated database users with least-privilege permissions, and secure RDS connections using TLS and certificate verification. Database credentials should be managed through AWS Secrets Manager instead of being hardcoded in application configuration."
+
+---
+
+# 11.44 Interview Follow-up Questions
+
+## Q1. What is the principle of least privilege?
+
+**Answer:**
+
+It means granting only the minimum permissions required for a user or service to perform its responsibility.
+
+---
+
+## Q2. Why should applications not use database root credentials?
+
+**Answer:**
+
+Root credentials provide excessive permissions. If the application or credentials are compromised, the attacker could perform destructive administrative operations.
+
+---
+
+## Q3. What is a read-only database user?
+
+**Answer:**
+
+A read-only user typically has permission to retrieve data but cannot modify it. This is useful for reporting, analytics, and read-specific workloads.
+
+---
+
+## Q4. Why use TLS between Spring Boot and RDS?
+
+**Answer:**
+
+TLS encrypts database communication and protects sensitive information while it travels between the application and the database.
+
+---
+
+## Q5. What is a Java truststore?
+
+**Answer:**
+
+A Java truststore contains certificates that the Java application trusts. During TLS communication, Java uses it to validate the certificate presented by the remote server.
+
+---
+
+## Q6. What is VERIFY_IDENTITY?
+
+**Answer:**
+
+It represents stronger certificate validation where the application verifies both certificate trust and the server's expected identity or hostname.
+
+---
+
+## Q7. Why use AWS Secrets Manager?
+
+**Answer:**
+
+It allows sensitive credentials such as database usernames and passwords to be stored outside application source code and accessed securely using AWS IAM permissions.
+
+---
+
+## Q8. Can environment variables contain secrets?
+
+**Answer:**
+
+They can, but they must be handled carefully because secrets may be exposed through logs, debugging, container inspection, or CI/CD misconfiguration. Managed secret injection is generally preferred in production environments.
+
+---
+
+## Q9. What is the difference between encryption in transit and encryption at rest?
+
+**Answer:**
+
+Encryption in transit protects data while it moves between systems, such as between Spring Boot and RDS. Encryption at rest protects stored data, such as database storage and backups.
+
+---
+
+## Q10. What happens if database credentials are rotated?
+
+**Answer:**
+
+The application must retrieve the updated credentials and establish new database connections. Connection pools such as HikariCP must also be considered because existing connections may continue using the old credentials until refreshed.
+
+---
+
+# 11.45 Key Takeaways
+
+```text
+Database Security
+       |
+       +-----------------------+
+       |                       |
+       v                       v
+Authentication            Authorization
+       |                       |
+       v                       v
+Who connects?           What can they do?
+```
+
+Secure connectivity:
+
+```text
+Spring Boot
+     |
+     | TLS
+     v
+Certificate Verification
+     |
+     v
+Private Network
+     |
+     v
+Security Group
+     |
+     v
+AWS RDS
+```
+
+Credential management:
+
+```text
+Application Code
+      |
+      X
+No Hardcoded Secrets
+      |
+      v
+AWS Secrets Manager
+      |
+      v
+IAM Controlled Access
+```
+
+Most important principle:
+
+> **Database security should use multiple layers. Credentials alone are not enough. Secure networking, least privilege, TLS, certificate verification, and secret management must work together.**
+
+---
+
+# 11.46 Topic Summary
+
+CitiCore database security focuses on protecting sensitive banking data throughout the entire database access lifecycle.
+
+The architecture includes:
+
+```text
+Secure Identity
++
+Least Privilege
++
+Read-Only Access Where Appropriate
++
+Private Networking
++
+Security Groups
++
+TLS Encryption
++
+RDS Certificate Validation
++
+Java Truststore
++
+Server Identity Verification
++
+AWS Secrets Manager
+```
+
+The complete security flow can be summarized as:
+
+```text
+Spring Boot Service
+        |
+        v
+IAM Permission
+        |
+        v
+AWS Secrets Manager
+        |
+        v
+Database Credentials
+        |
+        v
+HikariCP Connection Pool
+        |
+        v
+TLS Encrypted Connection
+        |
+        v
+Certificate Verification
+        |
+        v
+RDS Security Group
+        |
+        v
+AWS RDS
+        |
+        v
+Database Permission Check
+```
+
+The most important lesson is:
+
+> **A production database should never depend on a single security mechanism. Database protection should combine secure credentials, least privilege, network isolation, encryption, certificate verification, and controlled access.**
+
+---
+## Topic 12 - AWS Infrastructure
+
+## 12.1 What Is AWS Infrastructure?
+
+AWS infrastructure is the collection of cloud resources used to run, secure, network, deploy, and monitor an application.
+
+For CitiCore, AWS infrastructure provides the environment where containerized microservices and supporting services can run.
+
+At a high level, the infrastructure is responsible for:
+
+* Networking services securely
+* Running application containers
+* Exposing APIs to clients
+* Storing container images
+* Hosting databases
+* Managing permissions
+* Managing secrets
+* Collecting logs and metrics
+* Supporting service-to-service communication
+
+The simplified CitiCore AWS architecture is:
+
+```text
+Internet
+    |
+    v
+Application Load Balancer
+    |
+    v
+ECS / Fargate Services
+    |
+    +----------------------------+
+    |            |               |
+    v            v               v
+Auth Service  Account Service  Transaction Service
+    |            |               |
+    +------------+---------------+
+                 |
+                 v
+             AWS RDS
+```
+
+Supporting infrastructure includes:
+
+```text
+AWS
+ |
+ +-- VPC
+ |
+ +-- Subnets
+ |
+ +-- Route Tables
+ |
+ +-- Internet Gateway
+ |
+ +-- NAT Gateway
+ |
+ +-- Security Groups
+ |
+ +-- ECS / Fargate
+ |
+ +-- ECR
+ |
+ +-- ALB
+ |
+ +-- RDS
+ |
+ +-- Service Connect
+ |
+ +-- CloudWatch
+ |
+ +-- IAM
+ |
+ +-- Secrets Manager
+```
+
+The main goal is to provide a secure and manageable environment for CitiCore services.
+
+---
+
+# 12.2 Why Do We Need Cloud Infrastructure?
+
+During local development, CitiCore services can run using:
+
+```text
+Developer Machine
+       |
+       +-- Docker
+       |
+       +-- MySQL
+       |
+       +-- Kafka
+       |
+       +-- Redis
+       |
+       +-- Spring Boot Services
+```
+
+However, a production-like environment needs more than simply running containers.
+
+The application needs:
+
+* Controlled network access
+* Service availability
+* Centralized deployment
+* Secure database access
+* Load balancing
+* Container orchestration
+* Logging
+* IAM permissions
+* Secret management
+
+Therefore, the AWS architecture separates responsibilities.
+
+```text
+Application Layer
+       |
+       v
+ECS / Fargate
+```
+
+```text
+Networking Layer
+       |
+       v
+VPC / Subnets / Route Tables / Security Groups
+```
+
+```text
+Data Layer
+       |
+       v
+RDS
+```
+
+```text
+Traffic Layer
+       |
+       v
+Application Load Balancer
+```
+
+```text
+Container Registry
+       |
+       v
+ECR
+```
+
+```text
+Observability
+       |
+       v
+CloudWatch
+```
+
+```text
+Security
+       |
+       v
+IAM / Secrets Manager / Security Groups
+```
+
+---
+
+# 12.3 CitiCore AWS Architecture
+
+## CitiCore Context
+
+The CitiCore project uses a microservices architecture. This means multiple independently deployable services must communicate and operate inside the AWS environment.
+
+A simplified architecture is:
+
+```text
+                         Internet
+                            |
+                            v
+                  Application Load Balancer
+                            |
+                            v
+                       API Gateway
+                            |
+        +-------------------+-------------------+
+        |                   |                   |
+        v                   v                   v
+   Auth Service        User Service       Account Service
+        |                   |                   |
+        +-------------------+-------------------+
+                            |
+                            v
+                     Internal Services
+                            |
+                            v
+                         AWS RDS
+```
+
+Container images are managed separately:
+
+```text
+Developer / Jenkins
+        |
+        v
+Build Docker Image
+        |
+        v
+Amazon ECR
+        |
+        v
+ECS Task
+        |
+        v
+Run Container
+```
+
+Networking controls how these components communicate:
+
+```text
+VPC
+ |
+ +---------------------------------------------+
+ |                                             |
+ | Public Subnets                              |
+ |      |                                      |
+ |      +---- Application Load Balancer        |
+ |                                             |
+ | Private Subnets                             |
+ |      |                                      |
+ |      +---- ECS / Fargate Services           |
+ |                                             |
+ | Database Subnets                            |
+ |      |                                      |
+ |      +---- RDS                              |
+ |                                             |
+ +---------------------------------------------+
+```
+
+This separation is important because not every component should be directly exposed to the internet.
+
+---
+
+# 12.4 AWS Account Structure
+
+## What Is an AWS Account?
+
+An AWS account is a logical boundary for AWS resources, billing, permissions, and security controls.
+
+Resources such as:
+
+* VPC
+* ECS
+* RDS
+* ECR
+* IAM roles
+
+are created inside an AWS account.
+
+For a simple project environment:
+
+```text
+AWS Account
+     |
+     +-- CitiCore Infrastructure
+```
+
+A more mature production organization may separate environments:
+
+```text
+Organization
+     |
+     +--------------------------+
+     |            |             |
+     v            v             v
+Development    Staging      Production
+AWS Account    AWS Account  AWS Account
+```
+
+The main advantage is isolation.
+
+For example, development resources should not accidentally affect production resources.
+
+---
+
+## CitiCore Context
+
+For CitiCore, the important concept is understanding that AWS resources are organized under an AWS account and deployed in a selected AWS Region.
+
+Example:
+
+```text
+AWS Account
+      |
+      v
+AWS Region
+      |
+      v
+VPC
+      |
+      v
+CitiCore Resources
+```
+
+The exact multi-account production structure should not be claimed as implemented unless it exists in the final CitiCore deployment configuration.
+
+Therefore:
+
+### CitiCore Implementation
+
+CitiCore infrastructure was deployed within AWS resources such as ECS, RDS, ECR, VPC, ALB, IAM, and CloudWatch.
+
+### Production Improvement
+
+A larger production environment should separate development, staging, and production environments more strictly, potentially using separate AWS accounts.
+
+---
+
+# 12.5 AWS Region and Availability Zones
+
+## What Is an AWS Region?
+
+An AWS Region is a geographic area containing AWS infrastructure.
+
+For example:
+
+```text
+AWS
+ |
+ +-- Region
+       |
+       +-- Availability Zone A
+       |
+       +-- Availability Zone B
+       |
+       +-- Availability Zone C
+```
+
+Each Availability Zone contains separate infrastructure.
+
+This supports better availability.
+
+A highly available architecture may distribute resources across multiple Availability Zones.
+
+Example:
+
+```text
+                  VPC
+                   |
+        +----------+----------+
+        |                     |
+        v                     v
+Availability Zone A    Availability Zone B
+        |                     |
+        v                     v
+   ECS Tasks              ECS Tasks
+```
+
+An Application Load Balancer can distribute traffic between healthy targets.
+
+---
+
+## CitiCore Context
+
+For CitiCore, the important production design principle is:
+
+> Application containers and infrastructure should not unnecessarily depend on a single Availability Zone.
+
+The actual deployment should be described according to the final implemented AWS configuration.
+
+Where multi-AZ deployment was not fully implemented, it should be treated as a production improvement rather than claimed as an existing feature.
+
+---
+
+# 12.6 Virtual Private Cloud (VPC)
+
+## 1. What Is It?
+
+A VPC is a logically isolated virtual network inside AWS.
+
+It provides control over:
+
+* IP address ranges
+* Subnets
+* Routing
+* Internet access
+* Network boundaries
+
+Think of it as a private network created inside AWS.
+
+```text
+AWS Cloud
+    |
+    v
++-----------------------------------+
+|               VPC                 |
+|                                   |
+|  Your Private Cloud Network       |
+|                                   |
++-----------------------------------+
+```
+
+Inside the VPC, CitiCore resources communicate using controlled network paths.
+
+---
+
+# 12.7 Why Do We Need a VPC?
+
+Without network isolation, all resources would be difficult to organize and secure.
+
+A VPC allows CitiCore to define:
+
+```text
+Which resources are public?
+```
+
+```text
+Which resources are private?
+```
+
+```text
+Who can communicate with whom?
+```
+
+```text
+How does traffic enter the system?
+```
+
+```text
+How does private infrastructure access external services?
+```
+
+The architecture becomes:
+
+```text
+Internet
+    |
+    v
++----------------------------+
+|            VPC             |
+|                            |
+| Public Resources           |
+|                            |
+| Private Resources          |
+|                            |
+| Database Resources         |
++----------------------------+
+```
+
+---
+
+# 12.8 CitiCore VPC Architecture
+
+A simplified CitiCore network design is:
+
+```text
+                         VPC
++--------------------------------------------------+
+|                                                  |
+|  Public Subnet                                   |
+|                                                  |
+|      Internet Gateway                            |
+|             |                                    |
+|             v                                    |
+|      Application Load Balancer                   |
+|                                                  |
+|--------------------------------------------------|
+|                                                  |
+|  Private Subnet                                  |
+|                                                  |
+|      ECS / Fargate Services                      |
+|                                                  |
+|      +-- Auth Service                            |
+|      +-- User Service                            |
+|      +-- Account Service                         |
+|      +-- Transaction Service                     |
+|                                                  |
+|--------------------------------------------------|
+|                                                  |
+|  Database Subnet                                 |
+|                                                  |
+|      AWS RDS                                     |
+|                                                  |
++--------------------------------------------------+
+```
+
+The key idea is:
+
+```text
+Public Traffic
+      |
+      v
+ALB
+      |
+      v
+Private Application Services
+      |
+      v
+Private Database
+```
+
+The database should not need direct internet exposure.
+
+---
+
+# 12.9 Public and Private Subnets
+
+## What Is a Public Subnet?
+
+A public subnet is a subnet whose route configuration allows traffic to reach the internet through an Internet Gateway.
+
+Example:
+
+```text
+Public Subnet
+      |
+      v
+Internet Gateway
+      |
+      v
+Internet
+```
+
+Public-facing components may include:
+
+```text
+Application Load Balancer
+```
+
+The important point is that a resource being in a public subnet does not automatically mean every security rule is open.
+
+Security Groups still control access.
+
+---
+
+## What Is a Private Subnet?
+
+A private subnet does not directly expose resources to incoming internet traffic.
+
+For CitiCore:
+
+```text
+Private Subnet
+      |
+      +-- ECS Services
+      |
+      +-- Internal Components
+```
+
+The architecture becomes:
+
+```text
+Internet
+    |
+    v
+Public ALB
+    |
+    v
+Private ECS Services
+```
+
+Clients do not directly connect to every microservice container.
+
+---
+
+# 12.10 Why Separate Public and Private Subnets?
+
+The main reason is reducing exposure.
+
+Consider this unsafe design:
+
+```text
+Internet
+   |
+   +---------------------------+
+   |                           |
+   v                           v
+Auth Service              Account Service
+```
+
+Every service would potentially need public access.
+
+A better design is:
+
+```text
+Internet
+    |
+    v
+ALB
+    |
+    +-----------------------+
+    |                       |
+    v                       v
+Private Service        Private Service
+```
+
+Benefits include:
+
+* Reduced attack surface
+* Centralized public entry point
+* Better traffic control
+* Easier security management
+
+---
+
+# 12.11 Route Tables
+
+## What Is a Route Table?
+
+A route table determines where network traffic should go.
+
+Conceptually:
+
+```text
+Request
+   |
+   v
+Route Table
+   |
+   +----------------------+
+   |                      |
+   v                      v
+Internet Gateway      NAT Gateway
+```
+
+For example, a public subnet may have a route:
+
+```text
+Destination: Internet
+Target: Internet Gateway
+```
+
+A private subnet may route outbound traffic through:
+
+```text
+NAT Gateway
+```
+
+The exact routing configuration depends on the infrastructure design.
+
+---
+
+# 12.12 CitiCore Routing Concept
+
+The basic network flow is:
+
+```text
+Incoming Traffic
+
+Internet
+    |
+    v
+Internet Gateway
+    |
+    v
+Public Route Table
+    |
+    v
+Application Load Balancer
+```
+
+Internal traffic then flows to:
+
+```text
+ALB
+ |
+ v
+Private ECS Services
+```
+
+For outbound access from private services:
+
+```text
+Private ECS Service
+       |
+       v
+Private Route Table
+       |
+       v
+NAT Gateway
+       |
+       v
+Internet Gateway
+       |
+       v
+Internet / AWS Public Services
+```
+
+Not every service necessarily requires unrestricted outbound internet access.
+
+Production systems should restrict outbound access according to actual requirements.
+
+---
+
+# 12.13 Internet Gateway
+
+## What Is It?
+
+An Internet Gateway connects a VPC to the internet.
+
+Conceptually:
+
+```text
+Internet
+    |
+    v
+Internet Gateway
+    |
+    v
+VPC
+```
+
+For CitiCore, the Internet Gateway supports public-facing infrastructure such as an Application Load Balancer.
+
+The flow is:
+
+```text
+Client
+   |
+   v
+Internet
+   |
+   v
+Internet Gateway
+   |
+   v
+Application Load Balancer
+```
+
+The Internet Gateway does not replace security controls.
+
+Traffic still depends on:
+
+* Route tables
+* Security Groups
+* Resource configuration
+
+---
+
+# 12.14 NAT Gateway
+
+## What Is It?
+
+A NAT Gateway allows resources in a private subnet to initiate outbound connections without allowing unsolicited inbound internet connections.
+
+Example:
+
+```text
+Private ECS Service
+       |
+       v
+NAT Gateway
+       |
+       v
+Internet
+```
+
+The internet cannot directly initiate a connection to the private service through this path.
+
+This is useful when application containers need outbound access.
+
+For example:
+
+```text
+Private ECS Task
+      |
+      +---- Pull dependencies during some workflows
+      |
+      +---- Access external APIs
+      |
+      +---- Access permitted external services
+```
+
+The exact requirement depends on the application's architecture.
+
+---
+
+# 12.15 NAT Gateway Trade-off
+
+### Advantages
+
+* Private workloads can access external resources
+* Private services do not require public IP addresses
+* Better network isolation
+
+### Disadvantages
+
+* Additional infrastructure
+* Additional cost
+* Routing configuration complexity
+
+For a production architecture, NAT usage should be evaluated based on actual network requirements.
+
+---
+
+# 12.16 Security Groups
+
+## 1. What Is a Security Group?
+
+A Security Group acts as a virtual firewall for AWS resources.
+
+It controls:
+
+```text
+Inbound Traffic
+```
+
+and:
+
+```text
+Outbound Traffic
+```
+
+For example:
+
+```text
+ALB Security Group
+```
+
+might allow:
+
+```text
+Internet
+    |
+    +---- HTTPS
+    |
+    +---- HTTP
+```
+
+An ECS service security group might allow:
+
+```text
+ALB
+   |
+   v
+Application Port
+```
+
+An RDS security group might allow:
+
+```text
+ECS Service
+     |
+     v
+MySQL Port
+```
+
+---
+
+# 12.17 CitiCore Security Group Architecture
+
+The simplified CitiCore security model is:
+
+```text
+Internet
+    |
+    v
++-------------------+
+|   ALB Security    |
+|      Group        |
++-------------------+
+    |
+    | Allowed Application Traffic
+    v
++-------------------+
+|   ECS Security    |
+|      Group        |
++-------------------+
+    |
+    | Allowed Database Traffic
+    v
++-------------------+
+|   RDS Security    |
+|      Group        |
++-------------------+
+```
+
+This creates controlled communication paths.
+
+The desired principle is:
+
+```text
+Internet
+    |
+    v
+ALB
+    |
+    v
+ECS
+    |
+    v
+RDS
+```
+
+but not:
+
+```text
+Internet
+    |
+    v
+RDS
+```
+
+---
+
+# 12.18 Security Group Best Practice
+
+Avoid rules such as:
+
+```text
+Port: 3306
+Source: 0.0.0.0/0
+```
+
+This unnecessarily exposes the database.
+
+Instead:
+
+```text
+RDS Security Group
+      |
+      +-- Allow Port 3306
+              |
+              v
+      Source: ECS Security Group
+```
+
+Using a security group as the source is often better than allowing a broad IP range when communication occurs between AWS resources.
+
+The same principle applies to internal service communication.
+
+---
+
+# 12.19 AWS RDS
+
+## What Is RDS?
+
+Amazon RDS is a managed relational database service.
+
+For CitiCore, RDS is used for relational database workloads.
+
+RDS manages many operational responsibilities such as:
+
+* Database infrastructure
+* Automated backups depending on configuration
+* Monitoring integration
+* Database instance management
+* Managed database engine support
+
+CitiCore services connect to the database using:
+
+```text
+Spring Boot
+     |
+     v
+JDBC / JPA
+     |
+     v
+AWS RDS
+```
+
+---
+
+# 12.20 CitiCore RDS Architecture
+
+The CitiCore database architecture includes concepts such as:
+
+```text
+Primary Database
+```
+
+and:
+
+```text
+Read Replica
+```
+
+The simplified architecture is:
+
+```text
+Account Service
+      |
+      +-------------------+
+      |                   |
+      v                   v
+Primary DB            Read Replica
+   Write                 Read
+```
+
+This supports read/write separation.
+
+However, database architecture, replication, replica lag, datasource routing, and HikariCP were explained in detail in:
+
+> **Topic 9 — Database Architecture**
+
+This section focuses only on the AWS infrastructure role of RDS.
+
+RDS is the managed database platform supporting CitiCore's relational data layer.
+
+---
+
+# 12.21 RDS Network Placement
+
+A production database should generally not be directly accessible from the internet.
+
+The architecture should resemble:
+
+```text
+Internet
+    |
+    X
+    |
+    X
+    |
+RDS
+```
+
+Instead:
+
+```text
+ECS Service
+     |
+     v
+RDS Security Group
+     |
+     v
+Private RDS
+```
+
+This means database access is restricted to trusted application resources.
+
+---
+
+# 12.22 Amazon ECR
+
+## What Is ECR?
+
+Amazon Elastic Container Registry is a managed container image registry.
+
+CitiCore Docker images can be stored in ECR.
+
+The deployment flow is:
+
+```text
+Spring Boot Application
+        |
+        v
+Docker Build
+        |
+        v
+Docker Image
+        |
+        v
+Amazon ECR
+        |
+        v
+ECS Pulls Image
+        |
+        v
+Container Runs
+```
+
+ECR separates:
+
+```text
+Build Artifact Storage
+```
+
+from:
+
+```text
+Container Execution
+```
+
+---
+
+# 12.23 Why ECR Is Needed
+
+Without a container registry, ECS would not know where to retrieve application images.
+
+The workflow is:
+
+```text
+Developer / Jenkins
+       |
+       v
+Build Image
+       |
+       v
+Push Image
+       |
+       v
+Container Registry
+       |
+       v
+Deployment Platform Pulls Image
+```
+
+For CitiCore:
+
+```text
+Jenkins / Local Build
+          |
+          v
+         ECR
+          |
+          v
+         ECS
+```
+
+---
+
+# 12.24 ECS
+
+## What Is Amazon ECS?
+
+Amazon Elastic Container Service is a container orchestration service.
+
+It manages how containers are:
+
+* Defined
+* Started
+* Stopped
+* Replaced
+* Scaled
+* Connected to infrastructure
+
+For CitiCore:
+
+```text
+Docker Image
+      |
+      v
+ECS Task Definition
+      |
+      v
+ECS Task
+      |
+      v
+Running Container
+```
+
+An ECS Service manages the desired number of running tasks.
+
+---
+
+# 12.25 CitiCore ECS Architecture
+
+A simplified architecture is:
+
+```text
+ECS Cluster
+     |
+     +----------------------------------+
+     |                                  |
+     v                                  v
+Auth Service                       Account Service
+ECS Service                        ECS Service
+     |                                  |
+     v                                  v
+Task Definition                    Task Definition
+     |                                  |
+     v                                  v
+Container                           Container
+```
+
+Each microservice can have:
+
+* Its own Docker image
+* Its own task definition
+* Its own ECS service
+* Its own environment configuration
+* Its own health checks
+
+This supports independent deployment.
+
+For example:
+
+```text
+Deploy Account Service
+        |
+        v
+Account Service Updated
+```
+
+without necessarily redeploying:
+
+```text
+Auth Service
+```
+
+This is one of the advantages of a microservices architecture.
+
+---
+
+# 12.26 ECS Cluster
+
+An ECS cluster is a logical grouping of ECS services and tasks.
+
+Conceptually:
+
+```text
+CitiCore ECS Cluster
+        |
+        +--------------------------+
+        |                          |
+        v                          v
+Account Service                User Service
+        |                          |
+        v                          v
+ECS Task                     ECS Task
+```
+
+The cluster provides the environment where ECS schedules workloads.
+
+---
+
+# 12.27 ECS Service
+
+An ECS Service maintains the desired number of running tasks.
+
+For example:
+
+```text
+Desired Tasks: 2
+```
+
+If one task stops:
+
+```text
+Task 1  ✓ Running
+
+Task 2  X Failed
+```
+
+ECS Service attempts to restore the desired state:
+
+```text
+Task 1  ✓ Running
+
+Task 2  ✓ Replacement Task Started
+```
+
+This provides basic orchestration and recovery behavior.
+
+---
+
+# 12.28 ECS Task Definition
+
+A task definition describes how a container should run.
+
+It may include:
+
+* Docker image
+* CPU
+* Memory
+* Port mappings
+* Environment variables
+* Secrets
+* Logging configuration
+* IAM roles
+
+Conceptually:
+
+```text
+Task Definition
+      |
+      +-- Docker Image
+      |
+      +-- CPU / Memory
+      |
+      +-- Environment
+      |
+      +-- Secrets
+      |
+      +-- Ports
+      |
+      +-- Logging
+```
+
+The task definition acts as the deployment configuration for the container.
+
+---
+
+# 12.29 AWS Fargate
+
+## What Is Fargate?
+
+Fargate is a serverless compute engine for containers.
+
+Instead of managing EC2 instances:
+
+```text
+You Manage:
+EC2 Servers
+OS
+Capacity
+Container Runtime
+```
+
+with Fargate:
+
+```text
+AWS Manages:
+Underlying Infrastructure
+```
+
+while the application team focuses on:
+
+```text
+Container
+Task Definition
+Service
+Resources
+```
+
+For CitiCore:
+
+```text
+Docker Container
+       |
+       v
+ECS
+       |
+       v
+Fargate
+       |
+       v
+AWS Runs Container
+```
+
+---
+
+# 12.30 Why Fargate for CitiCore?
+
+The main advantages include:
+
+* No EC2 server management
+* Simpler container deployment
+* Integration with ECS
+* Easier operational management
+
+For a project focused on microservices deployment, Fargate allows the architecture to focus more on application containers and less on infrastructure server management.
+
+---
+
+# 12.31 Fargate Trade-offs
+
+### Advantages
+
+* No server administration
+* Simplified container deployment
+* AWS-managed infrastructure
+* Good ECS integration
+
+### Disadvantages
+
+* Less low-level control than managing EC2 directly
+* Cost may not be optimal for every workload
+* Startup behavior and resource configuration must still be managed
+
+The correct choice depends on workload requirements.
+
+---
+
+# 12.32 Application Load Balancer (ALB)
+
+## What Is an ALB?
+
+An Application Load Balancer receives HTTP/HTTPS traffic and routes requests to application targets.
+
+For CitiCore:
+
+```text
+Client
+   |
+   v
+Application Load Balancer
+   |
+   v
+Application Target
+```
+
+The ALB acts as a controlled entry point for external traffic.
+
+---
+
+# 12.33 CitiCore ALB Architecture
+
+The basic flow is:
+
+```text
+Client
+   |
+   v
+Internet
+   |
+   v
+Application Load Balancer
+   |
+   v
+Target Group
+   |
+   v
+ECS Service
+   |
+   v
+Spring Boot Application
+```
+
+The ALB can distribute traffic across healthy targets.
+
+For example:
+
+```text
+                    ALB
+                     |
+          +----------+----------+
+          |                     |
+          v                     v
+       Task 1                Task 2
+       Healthy               Healthy
+```
+
+This improves availability when multiple tasks are deployed.
+
+---
+
+# 12.34 ALB Health Checks
+
+The ALB needs to know whether an application target is healthy.
+
+A health check flow is:
+
+```text
+ALB
+ |
+ v
+GET /health
+ |
+ +---------------------+
+ |                     |
+ v                     v
+Healthy             Unhealthy
+ |                     |
+ v                     v
+Receive Traffic     Stop Routing Traffic
+```
+
+For Spring Boot applications, health endpoints can be exposed using Spring Boot Actuator depending on the implementation.
+
+A typical concept is:
+
+```text
+/actuator/health
+```
+
+The exact health-check endpoint should match the deployed CitiCore configuration.
+
+---
+
+# 12.35 Why Health Checks Matter
+
+Suppose an ECS container is running but the application inside it has failed.
+
+Example:
+
+```text
+Container
+    |
+    +-- Running
+          |
+          X
+          |
+    Application Unhealthy
+```
+
+A container being started does not always mean the application is ready.
+
+Health checks allow the load balancer to detect unhealthy application targets.
+
+```text
+ALB
+ |
+ v
+Health Check
+ |
+ v
+Application Healthy?
+ |
+ +-------------+
+ |             |
+Yes            No
+ |             |
+ v             v
+Route        Remove
+Traffic      from Routing
+```
+
+---
+
+# 12.36 Service-to-Service Communication
+
+CitiCore contains multiple microservices.
+
+Examples include:
+
+* Auth Service
+* User Service
+* Account Service
+* Transaction Service
+* Notification Service
+
+Internal communication should not always depend on public internet endpoints.
+
+Conceptually:
+
+```text
+Account Service
+       |
+       v
+Internal Service Network
+       |
+       v
+Transaction Service
+```
+
+AWS Service Connect can help with internal service communication.
+
+---
+
+# 12.37 AWS Service Connect
+
+## What Is It?
+
+AWS Service Connect provides service discovery and connectivity capabilities for ECS services.
+
+Conceptually:
+
+```text
+Service A
+    |
+    v
+Service Connect
+    |
+    v
+Service B
+```
+
+Instead of requiring external public addresses for internal communication:
+
+```text
+Service A
+     |
+     v
+Internal Service Name
+     |
+     v
+Service B
+```
+
+This supports cleaner internal communication inside the ECS environment.
+
+---
+
+# 12.38 CitiCore Context: Eureka vs Service Connect
+
+Earlier in CitiCore, service discovery concepts were implemented using:
+
+```text
+Eureka
+```
+
+The AWS deployment environment can also use:
+
+```text
+AWS Service Connect
+```
+
+These solve related problems but operate differently.
+
+Conceptually:
+
+```text
+Application-Level Discovery
+          |
+          v
+        Eureka
+```
+
+versus:
+
+```text
+Infrastructure-Level Service Connectivity
+          |
+          v
+AWS Service Connect
+```
+
+The detailed comparison was covered under:
+
+> **Topic 4 — Service Discovery**
+
+The important AWS infrastructure point is that Service Connect can support internal ECS service communication and reduce dependence on externally exposed service addresses.
+
+---
+
+# 12.39 CloudWatch
+
+## What Is CloudWatch?
+
+Amazon CloudWatch provides monitoring and observability capabilities for AWS resources and applications.
+
+It can help collect:
+
+* Logs
+* Metrics
+* Alarms
+
+For CitiCore:
+
+```text
+ECS Container
+      |
+      v
+Application Logs
+      |
+      v
+CloudWatch Logs
+```
+
+Infrastructure metrics can also be monitored.
+
+---
+
+# 12.40 CitiCore Logging Architecture
+
+A simplified logging flow is:
+
+```text
+Spring Boot Application
+        |
+        v
+Container stdout / stderr
+        |
+        v
+ECS Logging Configuration
+        |
+        v
+CloudWatch Logs
+```
+
+This allows centralized log access instead of requiring direct access to individual containers.
+
+Useful log events include:
+
+* Application startup
+* Request failures
+* Database errors
+* Kafka failures
+* Service communication failures
+
+Sensitive values must not be logged.
+
+For example:
+
+```text
+Passwords
+Tokens
+Secrets
+```
+
+should not appear in application logs.
+
+---
+
+# 12.41 CloudWatch Metrics
+
+Important infrastructure metrics can include:
+
+```text
+ECS
+ |
+ +-- CPU Utilization
+ |
+ +-- Memory Utilization
+ |
+ +-- Running Tasks
+```
+
+For the Application Load Balancer:
+
+```text
+ALB
+ |
+ +-- Request Count
+ |
+ +-- Target Response Errors
+ |
+ +-- Healthy Targets
+```
+
+For RDS:
+
+```text
+RDS
+ |
+ +-- CPU
+ |
+ +-- Connections
+ |
+ +-- Storage
+ |
+ +-- Replica Health
+```
+
+The exact monitoring configuration should be documented separately under Production Readiness.
+
+---
+
+# 12.42 CloudWatch Alarms
+
+CloudWatch alarms can notify operators when important conditions occur.
+
+Examples:
+
+```text
+High CPU
+```
+
+```text
+High Memory
+```
+
+```text
+Application Errors
+```
+
+```text
+Unhealthy ECS Tasks
+```
+
+```text
+Database Resource Issues
+```
+
+Conceptually:
+
+```text
+Metric
+   |
+   v
+Threshold
+   |
+   v
+Exceeded?
+   |
+   +----------+
+   |          |
+  No         Yes
+   |          |
+   v          v
+Continue    Alarm
+```
+
+Production alert thresholds should be based on actual workload behavior rather than arbitrary values.
+
+---
+
+# 12.43 IAM
+
+## What Is IAM?
+
+AWS Identity and Access Management controls access to AWS resources.
+
+IAM answers:
+
+```text
+Who can perform an action?
+```
+
+and:
+
+```text
+What action are they allowed to perform?
+```
+
+For CitiCore, IAM is important for:
+
+* ECS task permissions
+* ECR access
+* Secrets Manager access
+* CloudWatch logging
+* CI/CD deployment permissions
+
+---
+
+# 12.44 IAM Roles
+
+Applications should generally use IAM roles instead of storing permanent AWS access keys inside containers.
+
+Conceptually:
+
+```text
+ECS Task
+    |
+    v
+IAM Role
+    |
+    v
+AWS Permissions
+```
+
+For example:
+
+```text
+Account Service
+       |
+       v
+IAM Task Role
+       |
+       +---- Read Required Secret
+       |
+       +---- Write Application Logs
+```
+
+The service should not receive unnecessary permissions.
+
+This follows:
+
+> **Principle of Least Privilege**
+
+---
+
+# 12.45 ECS Task Role vs Execution Role
+
+A useful ECS distinction is:
+
+## Task Execution Role
+
+Used by ECS infrastructure to perform operations required to start and run the task.
+
+Examples can include:
+
+```text
+Pull Image from ECR
+```
+
+```text
+Send Logs to CloudWatch
+```
+
+```text
+Retrieve configured secrets during task startup
+```
+
+depending on configuration.
+
+---
+
+## Task Role
+
+Used by the application running inside the container to access AWS services.
+
+Example:
+
+```text
+Spring Boot Application
+       |
+       v
+Task Role
+       |
+       v
+AWS Service
+```
+
+For example:
+
+```text
+Application
+     |
+     v
+Secrets Manager
+```
+
+The two roles should not be confused.
+
+---
+
+# 12.46 Secrets Manager
+
+Sensitive configuration should not be hardcoded into:
+
+```text
+Docker Image
+```
+
+```text
+application.yml
+```
+
+```text
+Jenkinsfile
+```
+
+Instead:
+
+```text
+ECS Task
+    |
+    v
+IAM Permission
+    |
+    v
+AWS Secrets Manager
+    |
+    v
+Database Credentials
+```
+
+Secrets Manager was explained in detail in:
+
+> **Topic 11 — Database Security**
+
+This section only establishes its role in the AWS infrastructure architecture.
+
+---
+
+# 12.47 Complete CitiCore AWS Infrastructure Flow
+
+The overall infrastructure can be represented as:
+
+```text
+                         Internet
+                            |
+                            v
+                    Internet Gateway
+                            |
+                            v
+                 Application Load Balancer
+                            |
+                            v
+                    Target Group / Routing
+                            |
+                            v
++----------------------------------------------------+
+|                       VPC                          |
+|                                                    |
+|   Private Application Environment                  |
+|                                                    |
+|      +-------------------------------+             |
+|      |        ECS Cluster            |             |
+|      |                               |             |
+|      |  +-------------------------+  |             |
+|      |  | Auth Service            |  |             |
+|      |  +-------------------------+  |             |
+|      |                               |             |
+|      |  +-------------------------+  |             |
+|      |  | Account Service         |  |             |
+|      |  +-------------------------+  |             |
+|      |                               |             |
+|      |  +-------------------------+  |             |
+|      |  | Transaction Service     |  |             |
+|      |  +-------------------------+  |             |
+|      +-------------------------------+             |
+|                                                    |
+|                    |                               |
+|                    v                               |
+|                 AWS RDS                            |
+|                                                    |
++----------------------------------------------------+
+```
+
+Supporting services:
+
+```text
+ECR
+ |
+ v
+Container Images
+ |
+ v
+ECS
+```
+
+```text
+IAM
+ |
+ v
+Controlled AWS Permissions
+```
+
+```text
+Secrets Manager
+ |
+ v
+Sensitive Configuration
+```
+
+```text
+CloudWatch
+ |
+ v
+Logs and Monitoring
+```
+
+---
+
+# 12.48 End-to-End Deployment Architecture
+
+A CitiCore service deployment follows this general path:
+
+```text
+Developer
+    |
+    v
+Source Code
+    |
+    v
+Git Repository
+    |
+    v
+Jenkins Pipeline
+    |
+    v
+Maven Build
+    |
+    v
+Docker Image
+    |
+    v
+Amazon ECR
+    |
+    v
+ECS Task Definition
+    |
+    v
+ECS Service Deployment
+    |
+    v
+Fargate Runs Container
+    |
+    v
+ALB Routes Traffic
+```
+
+Runtime dependencies:
+
+```text
+ECS Task
+    |
+    +---- IAM Role
+    |
+    +---- Secrets
+    |
+    +---- CloudWatch Logs
+    |
+    +---- RDS Connection
+```
+
+---
+
+# 12.49 Failure Handling at the Infrastructure Layer
+
+Infrastructure failures must be considered separately from application failures.
+
+---
+
+## ECS Task Failure
+
+```text
+Container Stops
+      |
+      v
+ECS Detects Desired Count Mismatch
+      |
+      v
+Replacement Task Started
+```
+
+The ECS Service attempts to maintain the desired number of tasks.
+
+---
+
+## Unhealthy Application
+
+```text
+Application Running
+        |
+        X
+     Unhealthy
+        |
+        v
+ALB Health Check Fails
+        |
+        v
+ALB Stops Routing New Traffic
+```
+
+The exact recovery behavior depends on ECS health checks, service configuration, and deployment settings.
+
+---
+
+## Database Failure
+
+```text
+Application
+     |
+     v
+Database Connection Failure
+```
+
+The application must handle:
+
+* Connection failures
+* Timeouts
+* Retry policies where appropriate
+* Error responses
+
+Infrastructure monitoring should detect database health issues.
+
+---
+
+## Deployment Failure
+
+```text
+New ECS Deployment
+       |
+       v
+New Tasks Start
+       |
+       v
+Health Check
+       |
+       +----------------+
+       |                |
+    Healthy          Unhealthy
+       |                |
+       v                v
+Continue          Investigate / Rollback
+```
+
+Rollback strategy is covered in more detail under AWS Container Deployment and Jenkins CI/CD.
+
+---
+
+# 12.50 Real CitiCore Infrastructure Work
+
+Based on the CitiCore implementation and project work, important AWS activities included:
+
+* Creating AWS infrastructure resources
+* Working with ECS services and tasks
+* Deploying multiple containerized services
+* Working with ECR container images
+* Configuring ECS/Fargate deployment
+* Working with Application Load Balancer concepts
+* Managing VPC networking
+* Working with security groups
+* Using RDS
+* Monitoring AWS resources
+* Investigating ECS task states and service scaling
+* Cleaning up running services and tasks to reduce unnecessary AWS resource usage
+
+These are important because they represent practical project experience rather than only theoretical AWS knowledge.
+
+---
+
+# 12.51 Real Issue Context: ECS Tasks and Services
+
+## Real Issue
+
+During CitiCore AWS work, multiple services and ECS tasks were running in the cluster.
+
+The task list showed several CitiCore services running as ECS tasks.
+
+The practical question encountered was whether stopping tasks or reducing service desired counts would stop the infrastructure workloads.
+
+---
+
+## Root Cause
+
+In ECS, a distinction exists between:
+
+```text
+ECS Task
+```
+
+and:
+
+```text
+ECS Service
+```
+
+A task started manually can simply stop.
+
+However, a task managed by an ECS Service behaves differently.
+
+```text
+ECS Service
+      |
+      v
+Desired Count
+      |
+      v
+Maintain Number of Tasks
+```
+
+If a service has:
+
+```text
+Desired Count = 1
+```
+
+and its task is manually stopped:
+
+```text
+Task Stopped
+      |
+      v
+ECS Service Detects Missing Task
+      |
+      v
+Replacement Task Started
+```
+
+---
+
+## Solution
+
+To intentionally stop service-managed workloads:
+
+```text
+ECS Service
+      |
+      v
+Update Desired Count
+      |
+      v
+0
+```
+
+Conceptually:
+
+```text
+Desired Count: 1
+        |
+        v
+Running Task
+```
+
+Change to:
+
+```text
+Desired Count: 0
+        |
+        v
+No Running Task
+```
+
+This is different from simply stopping individual tasks.
+
+---
+
+## Prevention
+
+Before stopping infrastructure resources, identify:
+
+```text
+Is this task managed by an ECS Service?
+```
+
+If yes:
+
+```text
+Update Service Desired Count
+```
+
+rather than relying only on manually stopping tasks.
+
+---
+
+## Interview Explanation
+
+> "While working with ECS, I learned the difference between a task and a service. If a task belongs to an ECS Service, manually stopping the task does not permanently stop the workload because ECS tries to maintain the configured desired count. To intentionally stop the service, the desired count must be reduced, for example to zero."
+
+This is a practical AWS troubleshooting point and demonstrates real understanding of ECS behavior.
+
+---
+
+# 12.52 Architecture Decisions
+
+## Decision 1 — Containerized Microservices
+
+CitiCore services are containerized because each service can be independently packaged and deployed.
+
+```text
+Account Service
+       |
+       v
+Docker Image
+```
+
+```text
+Transaction Service
+       |
+       v
+Docker Image
+```
+
+### Advantage
+
+Independent deployment.
+
+### Trade-off
+
+More infrastructure and operational complexity.
+
+---
+
+# 12.53 Decision 2 — ECS/Fargate
+
+CitiCore uses AWS container infrastructure rather than manually managing application processes on individual virtual machines.
+
+### Advantage
+
+```text
+Less Server Management
+```
+
+### Trade-off
+
+```text
+More Dependency on AWS Managed Infrastructure
+```
+
+---
+
+# 12.54 Decision 3 — ALB as the Entry Point
+
+Instead of exposing every service directly:
+
+```text
+Internet
+    |
+    +---- Auth Service
+    |
+    +---- Account Service
+    |
+    +---- Transaction Service
+```
+
+CitiCore infrastructure can use:
+
+```text
+Internet
+    |
+    v
+ALB
+    |
+    v
+Application Infrastructure
+```
+
+### Advantage
+
+Centralized traffic management.
+
+### Trade-off
+
+Requires additional routing and health-check configuration.
+
+---
+
+# 12.55 Decision 4 — Private Application Services
+
+The application services should not require direct internet exposure.
+
+```text
+Internet
+    |
+    v
+ALB
+    |
+    v
+Private ECS Services
+```
+
+### Advantage
+
+Reduced attack surface.
+
+### Trade-off
+
+Internal networking configuration becomes more complex.
+
+---
+
+# 12.56 Decision 5 — Managed Database Using RDS
+
+Instead of manually running a database server:
+
+```text
+EC2
+ |
+ v
+Manual MySQL Installation
+```
+
+CitiCore uses managed database infrastructure:
+
+```text
+AWS RDS
+```
+
+### Advantages
+
+* Reduced infrastructure management
+* AWS database service integration
+* Managed operational capabilities
+
+### Trade-offs
+
+* Less low-level infrastructure control
+* AWS-specific operational considerations
+
+---
+
+# 12.57 Decision 6 — ECR for Container Images
+
+Using ECR keeps container images close to the AWS deployment environment.
+
+```text
+Build
+  |
+  v
+ECR
+  |
+  v
+ECS
+```
+
+### Advantages
+
+* AWS integration
+* Centralized image registry
+* Controlled image storage
+
+---
+
+# 12.58 Production Considerations
+
+The current CitiCore project infrastructure provides practical AWS deployment experience, but a real banking production system would require additional controls.
+
+---
+
+## High Availability
+
+Production services should run across multiple Availability Zones where required.
+
+```text
+ALB
+ |
+ +-----------------------+
+ |                       |
+ v                       v
+AZ-A                    AZ-B
+ECS Task                ECS Task
+```
+
+---
+
+## Auto Scaling
+
+The number of running tasks may need to increase based on demand.
+
+Conceptually:
+
+```text
+Traffic Increases
+       |
+       v
+CPU / Memory / Request Metrics
+       |
+       v
+Scaling Policy
+       |
+       v
+More ECS Tasks
+```
+
+Scaling policies should be based on actual workload requirements.
+
+---
+
+## Database High Availability
+
+A production database should consider:
+
+* Multi-AZ configuration
+* Backups
+* Recovery strategy
+* Replica monitoring
+
+The exact design depends on RPO and RTO requirements.
+
+---
+
+## Network Segmentation
+
+Production systems should separate:
+
+```text
+Public Layer
+```
+
+```text
+Application Layer
+```
+
+```text
+Data Layer
+```
+
+with controlled communication between them.
+
+---
+
+## Secrets
+
+Production secrets should:
+
+* Not be hardcoded
+* Not be stored in Git
+* Be accessed through IAM
+* Be rotated according to security requirements
+
+---
+
+## Observability
+
+Production infrastructure should monitor:
+
+```text
+Application
++
+Container
++
+Network
++
+Database
++
+Load Balancer
+```
+
+rather than monitoring only whether the server is running.
+
+---
+
+# 12.59 How I Would Explain the AWS Architecture in an Interview
+
+> "For CitiCore, I used AWS infrastructure to deploy containerized microservices. The services are packaged as Docker images and stored in Amazon ECR. ECS with Fargate runs the containers, while the ECS Service maintains the desired number of running tasks.
+>
+> The application is deployed inside a VPC with network separation between public-facing and private resources. An Application Load Balancer acts as the external traffic entry point and routes requests to healthy application targets. Security Groups restrict communication between the ALB, ECS services, and RDS database.
+>
+> RDS provides the managed relational database layer, CloudWatch is used for centralized logging and monitoring, and IAM controls access to AWS resources and secrets. For internal service communication, AWS Service Connect can also be used in the ECS environment."
+
+---
+
+# 12.60 30–60 Second Interview Answer
+
+> "In CitiCore, I deployed microservices on AWS using ECS and Fargate. Each Spring Boot service is containerized with Docker, pushed to Amazon ECR, and deployed through an ECS service. The application runs inside a VPC, where the ALB acts as the public entry point and the application containers remain in private networking layers. Security Groups control traffic between the ALB, ECS services, and RDS. I also worked with CloudWatch for monitoring and IAM roles for secure AWS resource access."
+
+---
+
+# 12.61 Interview Follow-up Questions
+
+## Q1. What is the difference between ECS and Fargate?
+
+**Answer:**
+
+ECS is the container orchestration service. Fargate is the serverless compute option that runs ECS containers without requiring us to manage EC2 instances.
+
+---
+
+## Q2. What is the difference between an ECS Task and an ECS Service?
+
+**Answer:**
+
+A task is an instance of a task definition running one or more containers. An ECS Service manages and maintains the desired number of running tasks.
+
+---
+
+## Q3. What happens if you manually stop a task managed by an ECS Service?
+
+**Answer:**
+
+If the service still has a desired count greater than zero, ECS will attempt to start a replacement task to maintain the desired state.
+
+---
+
+## Q4. Why use ECR?
+
+**Answer:**
+
+ECR stores Docker images that ECS can pull during deployment. It integrates directly with AWS container infrastructure.
+
+---
+
+## Q5. Why use an ALB?
+
+**Answer:**
+
+An ALB provides a centralized HTTP/HTTPS entry point, routes traffic to healthy targets, and supports health checks and load distribution.
+
+---
+
+## Q6. What is a VPC?
+
+**Answer:**
+
+A VPC is a logically isolated network in AWS where we define IP ranges, subnets, routing, and network boundaries for resources.
+
+---
+
+## Q7. Why place ECS services in private subnets?
+
+**Answer:**
+
+Private placement reduces direct internet exposure. External traffic can enter through an ALB while application services remain internal.
+
+---
+
+## Q8. What is a NAT Gateway?
+
+**Answer:**
+
+A NAT Gateway allows resources in private subnets to initiate outbound internet connections without accepting unsolicited inbound internet connections.
+
+---
+
+## Q9. How do Security Groups work?
+
+**Answer:**
+
+Security Groups act as virtual firewalls that control inbound and outbound traffic for AWS resources.
+
+---
+
+## Q10. Why should RDS not be publicly accessible?
+
+**Answer:**
+
+A database should generally be protected from direct internet access. Restricting access to trusted application resources reduces the attack surface.
+
+---
+
+## Q11. What is the difference between an ECS task role and task execution role?
+
+**Answer:**
+
+The execution role is used by ECS infrastructure to perform actions required to start the task, while the task role provides AWS permissions to the application running inside the container.
+
+---
+
+## Q12. How does ECS recover from a failed task?
+
+**Answer:**
+
+An ECS Service compares the number of running tasks with the configured desired count and attempts to start replacement tasks when necessary.
+
+---
+
+## Q13. How would you scale CitiCore on AWS?
+
+**Answer:**
+
+I would scale ECS services horizontally based on workload metrics, distribute tasks across Availability Zones, use ALB load balancing, and monitor database capacity separately.
+
+---
+
+# 12.62 Key Takeaways
+
+```text
+CitiCore AWS Infrastructure
+```
+
+is built around:
+
+```text
+VPC
+```
+
+for network isolation.
+
+```text
+Public and Private Subnets
+```
+
+for network segmentation.
+
+```text
+Security Groups
+```
+
+for controlled communication.
+
+```text
+ECR
+```
+
+for container image storage.
+
+```text
+ECS / Fargate
+```
+
+for running microservices.
+
+```text
+ALB
+```
+
+for incoming application traffic.
+
+```text
+RDS
+```
+
+for the relational database layer.
+
+```text
+IAM
+```
+
+for access control.
+
+```text
+Secrets Manager
+```
+
+for sensitive configuration.
+
+```text
+CloudWatch
+```
+
+for logs and monitoring.
+
+---
+
+# 12.63 Final Architecture Summary
+
+```text
+                         USERS
+                           |
+                           v
+                        INTERNET
+                           |
+                           v
+                    INTERNET GATEWAY
+                           |
+                           v
+                 APPLICATION LOAD BALANCER
+                           |
+                           v
++--------------------------------------------------+
+|                        VPC                       |
+|                                                  |
+|       +----------------------------------+       |
+|       |        PRIVATE SERVICES          |       |
+|       |                                  |       |
+|       |   ECS / FARGATE                  |       |
+|       |                                  |       |
+|       |   +-- Auth Service               |       |
+|       |   +-- User Service               |       |
+|       |   +-- Account Service            |       |
+|       |   +-- Transaction Service        |       |
+|       |   +-- Notification Service       |       |
+|       +----------------------------------+       |
+|                        |                         |
+|                        v                         |
+|                    AWS RDS                       |
+|                                                  |
++--------------------------------------------------+
+
+             SUPPORTING AWS SERVICES
+
+ECR ------------> Container Images
+IAM ------------> Access Control
+Secrets Manager -> Sensitive Configuration
+CloudWatch -----> Logs and Monitoring
+```
+
+The most important infrastructure principle is:
+
+> **CitiCore's AWS architecture separates traffic entry, application execution, data storage, networking, security, and observability so that microservices can be deployed and managed in a controlled cloud environment.**
+
+---
+
+## Topic 13 - Docker
+
+## 13.1 What Is Docker?
+
+Docker is a containerization platform that allows an application and its required runtime environment to be packaged into a container.
+
+In CitiCore, Docker is used to package Spring Boot microservices so that they can run consistently across different environments.
+
+Without Docker, an application may depend on the machine where it is running.
+
+For example:
+
+```text
+Developer Machine A
+    |
+    +-- Java Version A
+    +-- Maven Version A
+    +-- Environment Configuration A
+```
+
+Another environment may have:
+
+```text
+Developer Machine B
+    |
+    +-- Different Java Version
+    +-- Different Configuration
+    +-- Different Dependencies
+```
+
+This can lead to the common problem:
+
+> "It works on my machine."
+
+Docker reduces this problem by packaging the application with its required runtime environment.
+
+```text
+Spring Boot Application
+        |
+        v
+Docker Image
+        |
+        v
+Docker Container
+```
+
+The same image can then be used in different environments.
+
+```text
+Developer Machine
+        |
+        v
+Docker Image
+        |
+        +------------------+
+        |                  |
+        v                  v
+Local Environment       AWS ECS
+```
+
+---
+
+# 13.2 Why Do We Need Docker?
+
+CitiCore contains multiple microservices and supporting infrastructure components.
+
+These include services such as:
+
+* Auth Service
+* User Service
+* Account Service
+* Transaction Service
+* Notification Service
+* Config Server
+* Eureka Server
+* API Gateway
+
+The project also depends on infrastructure components such as:
+
+* MySQL
+* Kafka
+* Redis
+
+Running everything manually creates several problems.
+
+For example:
+
+```text
+Start Config Server
+        |
+        v
+Start Eureka Server
+        |
+        v
+Start API Gateway
+        |
+        v
+Start Auth Service
+        |
+        v
+Start User Service
+        |
+        v
+Start Account Service
+        |
+        v
+Start Transaction Service
+```
+
+In addition, supporting services must also be available.
+
+```text
+Start MySQL
+Start Kafka
+Start Redis
+```
+
+Docker helps standardize how these components are packaged and executed.
+
+---
+
+# 13.3 CitiCore Context
+
+## CitiCore Implementation
+
+Docker is used in CitiCore to containerize Spring Boot services.
+
+The general flow is:
+
+```text
+Java Source Code
+       |
+       v
+Maven Build
+       |
+       v
+Spring Boot JAR
+       |
+       v
+Docker Build
+       |
+       v
+Docker Image
+       |
+       v
+Docker Container
+```
+
+For deployment:
+
+```text
+Spring Boot Service
+        |
+        v
+Docker Image
+        |
+        v
+Container Registry
+        |
+        v
+AWS ECR
+        |
+        v
+ECS / Fargate
+```
+
+For local development, Docker and Docker Compose help run multiple services and dependencies together.
+
+---
+
+# 13.4 Docker Architecture
+
+The basic Docker architecture contains several important concepts.
+
+```text
+Developer
+    |
+    v
+Dockerfile
+    |
+    v
+docker build
+    |
+    v
+Docker Image
+    |
+    v
+docker run
+    |
+    v
+Docker Container
+```
+
+These concepts should not be confused.
+
+---
+
+# 13.5 Docker Image
+
+A Docker image is a packaged blueprint used to create containers.
+
+For a CitiCore service, an image may contain:
+
+```text
+Spring Boot Application
+        |
+        +-- Compiled JAR
+        |
+        +-- Java Runtime
+        |
+        +-- Application Startup Command
+```
+
+Conceptually:
+
+```text
+Docker Image
+     |
+     +-- Base Image
+     |
+     +-- Java Runtime
+     |
+     +-- CitiCore Application JAR
+     |
+     +-- Startup Configuration
+```
+
+An image is immutable after it is built.
+
+A new application version normally requires a new image.
+
+For example:
+
+```text
+citicore-account-service:1.0
+```
+
+After code changes:
+
+```text
+citicore-account-service:1.1
+```
+
+The image represents the packaged application version.
+
+---
+
+# 13.6 Docker Container
+
+A container is a running instance of a Docker image.
+
+The relationship is:
+
+```text
+Docker Image
+      |
+      v
+docker run
+      |
+      v
+Docker Container
+```
+
+One image can create multiple containers.
+
+Example:
+
+```text
+Account Service Image
+        |
+        +----------------+
+        |                |
+        v                v
+Container 1          Container 2
+```
+
+In CitiCore, a container runs a specific service instance.
+
+Example:
+
+```text
+Account Service Image
+        |
+        v
+Account Service Container
+        |
+        v
+Spring Boot Application
+```
+
+---
+
+# 13.7 Dockerfile
+
+A Dockerfile contains instructions for building a Docker image.
+
+A simplified Spring Boot Dockerfile structure is:
+
+```dockerfile
+FROM eclipse-temurin:17-jre
+
+WORKDIR /app
+
+COPY target/*.jar app.jar
+
+ENTRYPOINT ["java", "-jar", "app.jar"]
+```
+
+The important steps are:
+
+```text
+FROM
+ |
+ v
+Choose Base Image
+```
+
+```text
+WORKDIR
+ |
+ v
+Define Working Directory
+```
+
+```text
+COPY
+ |
+ v
+Copy Application Artifact
+```
+
+```text
+ENTRYPOINT
+ |
+ v
+Start Application
+```
+
+---
+
+# 13.8 CitiCore Dockerfile Flow
+
+The general CitiCore Docker build process is:
+
+```text
+Spring Boot Project
+        |
+        v
+mvn clean package
+        |
+        v
+target/application.jar
+        |
+        v
+Dockerfile
+        |
+        v
+COPY JAR into Image
+        |
+        v
+Run java -jar
+```
+
+Conceptually:
+
+```text
++----------------------------------+
+|         Docker Image             |
+|                                  |
+|  Java Runtime                    |
+|                                  |
+|  /app                            |
+|      |                           |
+|      +-- app.jar                 |
+|                                  |
+|  ENTRYPOINT                      |
+|      java -jar app.jar           |
++----------------------------------+
+```
+
+When the container starts:
+
+```text
+Docker Container
+        |
+        v
+java -jar app.jar
+        |
+        v
+Spring Boot Application
+```
+
+---
+
+# 13.9 Important Docker Commands
+
+## Check Docker Version
+
+```bash
+docker --version
+```
+
+---
+
+## View Running Containers
+
+```bash
+docker ps
+```
+
+This shows currently running containers.
+
+Example information includes:
+
+```text
+Container ID
+Image
+Command
+Status
+Ports
+Container Name
+```
+
+---
+
+## View All Containers
+
+```bash
+docker ps -a
+```
+
+This includes stopped containers.
+
+---
+
+## View Docker Images
+
+```bash
+docker images
+```
+
+or:
+
+```bash
+docker image ls
+```
+
+---
+
+## Build an Image
+
+```bash
+docker build -t citicore-account-service .
+```
+
+The command means:
+
+```text
+docker build
+```
+
+Build a Docker image.
+
+```text
+-t citicore-account-service
+```
+
+Assign a tag/name to the image.
+
+```text
+.
+```
+
+Use the current directory as the Docker build context.
+
+---
+
+## Run a Container
+
+```bash
+docker run -d -p 8080:8080 citicore-account-service
+```
+
+Conceptually:
+
+```text
+Host Port 8080
+      |
+      v
+Container Port 8080
+```
+
+The request flow becomes:
+
+```text
+Browser / Client
+       |
+       v
+localhost:8080
+       |
+       v
+Docker Container
+       |
+       v
+Spring Boot Application
+```
+
+---
+
+# 13.10 Port Mapping
+
+A container has its own network environment.
+
+Suppose the Spring Boot application listens on:
+
+```text
+8080
+```
+
+inside the container.
+
+Without port mapping:
+
+```text
+Host
+  X
+  |
+Container:8080
+```
+
+The application may not be accessible from the host through the expected port.
+
+Port mapping exposes the container port.
+
+```bash
+docker run -p 8080:8080 application
+```
+
+The flow becomes:
+
+```text
+Host:8080
+    |
+    v
+Container:8080
+    |
+    v
+Spring Boot Application
+```
+
+---
+
+# 13.11 Detached Mode
+
+Docker containers can run in detached mode.
+
+Example:
+
+```bash
+docker run -d application
+```
+
+Detached mode means the container runs in the background.
+
+This is useful when multiple CitiCore services need to run simultaneously.
+
+```text
+Docker
+   |
+   +-- Config Server
+   |
+   +-- Eureka Server
+   |
+   +-- API Gateway
+   |
+   +-- Account Service
+   |
+   +-- Transaction Service
+```
+
+---
+
+# 13.12 Container Logs
+
+Logs are essential for debugging.
+
+A common command is:
+
+```bash
+docker logs <container-id>
+```
+
+To continuously follow logs:
+
+```bash
+docker logs -f <container-id>
+```
+
+The troubleshooting flow is often:
+
+```text
+Container Not Working
+        |
+        v
+Check docker ps
+        |
+        v
+Check Container Logs
+        |
+        v
+Identify Application Error
+```
+
+For CitiCore, logs can help identify:
+
+* Spring Boot startup failures
+* Database connection errors
+* Configuration problems
+* Kafka connection issues
+* Port conflicts
+
+---
+
+# 13.13 Stop a Container
+
+A running container can be stopped using:
+
+```bash
+docker stop <container-id>
+```
+
+The container remains available but is no longer running.
+
+To start it again:
+
+```bash
+docker start <container-id>
+```
+
+To remove it:
+
+```bash
+docker rm <container-id>
+```
+
+---
+
+# 13.14 Remove a Docker Image
+
+An image can be removed using:
+
+```bash
+docker rmi <image-id>
+```
+
+However, Docker will not remove an image that is actively used by a container unless the related container is handled first.
+
+This relationship is important:
+
+```text
+Docker Image
+      |
+      v
+Docker Container
+```
+
+The image is the blueprint, while the container is the running or created instance.
+
+---
+
+# 13.15 Docker Networking
+
+Docker containers need to communicate with each other.
+
+For CitiCore, examples include:
+
+```text
+Account Service
+       |
+       v
+MySQL
+```
+
+```text
+Transaction Service
+       |
+       v
+Kafka
+```
+
+```text
+Service
+       |
+       v
+Redis
+```
+
+Docker networking allows containers to communicate through Docker-managed networks.
+
+Conceptually:
+
+```text
+Docker Network
+ |
+ +----------------------+
+ |                      |
+ v                      v
+Account Service       MySQL
+```
+
+---
+
+# 13.16 Why `localhost` Can Be a Problem Inside Docker
+
+One important Docker concept is:
+
+> `localhost` inside a container refers to that container itself.
+
+Consider:
+
+```text
+Account Service Container
+```
+
+If the application uses:
+
+```text
+localhost:3306
+```
+
+it expects MySQL to be running inside the same container.
+
+But in a multi-container architecture:
+
+```text
+Account Service Container
+        |
+        X localhost
+        |
+        v
+MySQL Container
+```
+
+The service should instead connect through the Docker network and service/container hostname.
+
+Conceptually:
+
+```text
+Account Service
+       |
+       v
+mysql
+       |
+       v
+MySQL Container
+```
+
+This is one of the most important concepts when running microservices using Docker.
+
+---
+
+# 13.17 Docker Networks in CitiCore
+
+A simplified CitiCore local architecture is:
+
+```text
+                Docker Network
++------------------------------------------------+
+|                                                |
+|  Config Server                                 |
+|       |                                        |
+|       v                                        |
+|  Eureka Server                                 |
+|       |                                        |
+|       v                                        |
+|  API Gateway                                   |
+|       |                                        |
+|       +------------------------------+         |
+|       |              |               |         |
+|       v              v               v         |
+|  Auth Service   Account Service  Transaction   |
+|                                    Service      |
+|                                                |
+|       +----------+------------+                |
+|       |          |            |                |
+|       v          v            v                |
+|    MySQL       Kafka        Redis              |
+|                                                |
++------------------------------------------------+
+```
+
+The exact service topology depends on the active CitiCore Docker Compose configuration.
+
+The main principle is:
+
+> Services running inside the same Docker network should communicate using the correct internal hostname rather than assuming `localhost`.
+
+---
+
+# 13.18 Docker Volumes
+
+Containers are designed to be replaceable.
+
+This creates a problem for persistent data.
+
+Suppose MySQL runs inside a container:
+
+```text
+MySQL Container
+       |
+       v
+Database Data
+```
+
+If the container is removed, the data may also be lost if persistence is not configured properly.
+
+Docker volumes provide persistent storage.
+
+```text
+MySQL Container
+       |
+       v
+Docker Volume
+       |
+       v
+Persistent Data
+```
+
+---
+
+# 13.19 Why Volumes Matter
+
+For infrastructure services such as databases:
+
+```text
+MySQL
+```
+
+or:
+
+```text
+Kafka
+```
+
+persistent data may be important depending on the environment.
+
+Conceptually:
+
+```text
+Container Removed
+       |
+       v
+New Container Created
+       |
+       v
+Existing Volume Reused
+```
+
+The application can continue using the persistent data.
+
+Volumes should be configured carefully because local development requirements and production persistence requirements are different.
+
+---
+
+# 13.20 Docker Compose
+
+## What Is Docker Compose?
+
+Docker Compose allows multiple containers to be defined and started using a single configuration file.
+
+This is particularly useful for a microservices project like CitiCore.
+
+Instead of manually running:
+
+```text
+docker run config-server
+docker run eureka-server
+docker run api-gateway
+docker run auth-service
+docker run account-service
+docker run transaction-service
+docker run mysql
+docker run kafka
+docker run redis
+```
+
+Docker Compose allows these services to be managed together.
+
+Conceptually:
+
+```text
+docker-compose.yml
+        |
+        v
+Docker Compose
+        |
+        +----------------------+
+        |                      |
+        v                      v
+Microservices             Infrastructure
+```
+
+---
+
+# 13.21 CitiCore Docker Compose Architecture
+
+The local environment can be represented as:
+
+```text
+docker-compose.yml
+        |
+        +-----------------------------+
+        |                             |
+        v                             v
+Application Services            Infrastructure
+        |                             |
+        +-- Config Server             +-- MySQL
+        +-- Eureka Server             +-- Kafka
+        +-- API Gateway               +-- Redis
+        +-- Auth Service
+        +-- User Service
+        +-- Account Service
+        +-- Transaction Service
+        +-- Notification Service
+```
+
+This simplifies local setup.
+
+Instead of manually starting every component, the developer can use one orchestration command.
+
+---
+
+# 13.22 Important Docker Compose Commands
+
+## Start Services
+
+```bash
+docker compose up
+```
+
+---
+
+## Start Services in Background
+
+```bash
+docker compose up -d
+```
+
+---
+
+## Check Running Services
+
+```bash
+docker compose ps
+```
+
+This command is useful because it shows the state of services managed by the Compose configuration.
+
+Example:
+
+```text
+NAME
+IMAGE
+SERVICE
+STATUS
+PORTS
+```
+
+---
+
+## Stop Services
+
+```bash
+docker compose down
+```
+
+---
+
+## Rebuild Services
+
+After application code or Docker configuration changes:
+
+```bash
+docker compose up --build
+```
+
+or:
+
+```bash
+docker compose build
+docker compose up -d
+```
+
+---
+
+# 13.23 CitiCore Local Development Flow
+
+The local execution flow is:
+
+```text
+Source Code Changes
+        |
+        v
+Maven Build
+        |
+        v
+Docker Build
+        |
+        v
+Docker Compose
+        |
+        v
+Start All Required Containers
+```
+
+The resulting environment may look like:
+
+```text
+Developer Machine
+        |
+        v
+Docker
+        |
+        +-------------------------+
+        |                         |
+        v                         v
+Spring Boot Services       Supporting Services
+        |                         |
+        +-- Auth                  +-- MySQL
+        +-- Account               +-- Kafka
+        +-- Transaction           +-- Redis
+        +-- Gateway
+```
+
+---
+
+# 13.24 Service Startup Order
+
+Microservices can have dependencies.
+
+For example:
+
+```text
+Config Server
+       |
+       v
+Eureka Server
+       |
+       v
+Application Services
+```
+
+A service may fail if a required dependency is unavailable during startup.
+
+For example:
+
+```text
+Account Service
+       |
+       v
+Needs Config Server
+       |
+       X
+Config Server Not Available
+```
+
+Docker Compose can define service dependencies, but an important practical point is:
+
+> Starting a dependency container does not always guarantee that the application inside that container is fully ready.
+
+For example:
+
+```text
+MySQL Container Started
+        |
+        X
+MySQL Still Initializing
+```
+
+Therefore, production-ready container orchestration should use appropriate health checks and retry behavior.
+
+---
+
+# 13.25 Docker Health Checks
+
+A container being in the `running` state does not always mean the application is healthy.
+
+Example:
+
+```text
+Container
+   |
+   +-- Running
+          |
+          X
+     Spring Boot Failed
+```
+
+Health checks help distinguish:
+
+```text
+Container Started
+```
+
+from:
+
+```text
+Application Ready
+```
+
+A health-check flow can be:
+
+```text
+Health Check
+     |
+     v
+Application Endpoint
+     |
+     +----------------+
+     |                |
+ Healthy          Unhealthy
+```
+
+For Spring Boot applications, this may use an Actuator health endpoint when configured.
+
+The exact health-check endpoint should match the active CitiCore implementation.
+
+---
+
+# 13.26 Docker Build Lifecycle
+
+The complete build flow is:
+
+```text
+Java Source Code
+       |
+       v
+Maven
+       |
+       v
+JAR File
+       |
+       v
+Docker Build Context
+       |
+       v
+Dockerfile
+       |
+       v
+Docker Image
+       |
+       v
+Docker Registry
+       |
+       v
+Deployment Platform
+```
+
+For CitiCore:
+
+```text
+Spring Boot
+     |
+     v
+Maven Package
+     |
+     v
+Docker Build
+     |
+     v
+CitiCore Service Image
+```
+
+---
+
+# 13.27 Image Tagging
+
+Docker images should be tagged properly.
+
+Example:
+
+```text
+citicore-account-service:latest
+```
+
+However, relying only on:
+
+```text
+latest
+```
+
+can create deployment ambiguity.
+
+A better approach is versioned or commit-based tags.
+
+Example:
+
+```text
+citicore-account-service:1.0.0
+```
+
+or:
+
+```text
+citicore-account-service:<git-sha>
+```
+
+This is especially useful for CI/CD.
+
+```text
+Git Commit
+    |
+    v
+Git SHA
+    |
+    v
+Docker Image Tag
+    |
+    v
+Deployment
+```
+
+Benefits include:
+
+* Better traceability
+* Easier rollback
+* Clearer deployment history
+
+---
+
+# 13.28 Docker in the CitiCore CI/CD Flow
+
+The general pipeline is:
+
+```text
+Git Push
+   |
+   v
+Jenkins Pipeline
+   |
+   v
+Maven Build
+   |
+   v
+Run Tests
+   |
+   v
+Docker Build
+   |
+   v
+Docker Image
+   |
+   v
+Push to ECR
+   |
+   v
+Deploy to ECS
+```
+
+Docker acts as the bridge between:
+
+```text
+Application Development
+```
+
+and:
+
+```text
+Container Deployment
+```
+
+The same application artifact is packaged into a container image and deployed to AWS infrastructure.
+
+---
+
+# 13.29 Multi-Service Deployment
+
+CitiCore is a microservices application.
+
+This means each service can have its own image.
+
+```text
++----------------------------+
+| Config Server Image        |
++----------------------------+
+
++----------------------------+
+| Eureka Server Image        |
++----------------------------+
+
++----------------------------+
+| API Gateway Image          |
++----------------------------+
+
++----------------------------+
+| Auth Service Image         |
++----------------------------+
+
++----------------------------+
+| Account Service Image      |
++----------------------------+
+
++----------------------------+
+| Transaction Service Image  |
++----------------------------+
+```
+
+This provides deployment independence.
+
+For example:
+
+```text
+Account Service Updated
+        |
+        v
+Build New Account Service Image
+        |
+        v
+Deploy Account Service
+```
+
+Other services do not necessarily need to be rebuilt.
+
+---
+
+# 13.30 Why Containerization Is Useful for Microservices
+
+Without containers, services may depend on machine-specific environments.
+
+```text
+Service A
+    |
+    v
+Machine A
+```
+
+```text
+Service B
+    |
+    v
+Machine B
+```
+
+Configuration differences can increase deployment complexity.
+
+With Docker:
+
+```text
+Service
+   |
+   v
+Standard Image
+   |
+   v
+Consistent Runtime
+```
+
+Each service has a predictable deployment artifact.
+
+---
+
+# 13.31 Docker vs Virtual Machines
+
+Docker containers and virtual machines solve different problems.
+
+## Virtual Machine
+
+```text
+Physical Server
+      |
+      v
+Hypervisor
+      |
+      +------------------+
+      |                  |
+      v                  v
+Virtual Machine      Virtual Machine
+      |                  |
+      v                  v
+Guest OS            Guest OS
+      |                  |
+      v                  v
+Application         Application
+```
+
+## Docker
+
+```text
+Host OS
+   |
+   v
+Docker Engine
+   |
+   +------------------+
+   |                  |
+   v                  v
+Container         Container
+   |                  |
+   v                  v
+Application      Application
+```
+
+Containers are generally more lightweight because they do not package a complete guest operating system in the same way as traditional virtual machines.
+
+---
+
+# 13.32 Docker Trade-offs
+
+## Advantages
+
+### Consistency
+
+The same Docker image can run across environments.
+
+```text
+Local
+  |
+  v
+Same Image
+  |
+  v
+Cloud
+```
+
+---
+
+### Portability
+
+Containers can run on different environments supporting the required container runtime.
+
+---
+
+### Independent Deployment
+
+Each CitiCore microservice can have its own image.
+
+---
+
+### Simplified Local Setup
+
+Docker Compose can start multiple dependencies together.
+
+---
+
+### CI/CD Integration
+
+Docker images can be built and deployed through automated pipelines.
+
+---
+
+## Disadvantages
+
+### Additional Complexity
+
+Developers must understand:
+
+* Images
+* Containers
+* Networks
+* Volumes
+* Registries
+* Port mappings
+
+---
+
+### Debugging Complexity
+
+Problems can occur at multiple layers:
+
+```text
+Application
+```
+
+```text
+Container
+```
+
+```text
+Docker Network
+```
+
+```text
+Host Machine
+```
+
+---
+
+### Image Management
+
+Images must be:
+
+* Tagged
+* Stored
+* Versioned
+* Cleaned up
+
+---
+
+# 13.33 Common Docker Problems in Microservices
+
+## Problem 1 — Container Starts but Application Is Not Accessible
+
+Possible causes include:
+
+* Incorrect port mapping
+* Application listening on another port
+* Container networking issue
+* Application startup failure
+
+Investigation:
+
+```bash
+docker ps
+```
+
+Check port mappings.
+
+Then:
+
+```bash
+docker logs <container-id>
+```
+
+Check application startup.
+
+---
+
+## Problem 2 — Service Cannot Connect to Another Container
+
+Possible cause:
+
+```text
+Using localhost
+```
+
+inside the container.
+
+Incorrect concept:
+
+```text
+Service Container
+    |
+    v
+localhost:9092
+```
+
+Correct approach depends on the Docker network configuration.
+
+Conceptually:
+
+```text
+Service Container
+    |
+    v
+kafka:9092
+    |
+    v
+Kafka Container
+```
+
+---
+
+## Problem 3 — Old Application Version Is Still Running
+
+Possible causes include:
+
+* Old image
+* Existing container
+* Application not rebuilt
+* Docker cache
+
+Investigation should verify:
+
+```text
+Source Code
+```
+
+```text
+JAR
+```
+
+```text
+Docker Image
+```
+
+```text
+Running Container
+```
+
+The important lesson is that changing source code does not automatically update a running Docker container.
+
+---
+
+# 13.34 Real CitiCore Docker Experience
+
+During CitiCore development, Docker was used to manage multiple services and support the local microservices environment.
+
+A practical environment involved services running through Docker Compose.
+
+The running service status was checked using commands such as:
+
+```bash
+docker compose ps
+```
+
+This was useful for identifying:
+
+* Which services were running
+* Which services were stopped
+* Container status
+* Port mappings
+
+The project also involved rebuilding services after code or configuration changes.
+
+A typical workflow was:
+
+```text
+Change Code
+    |
+    v
+Rebuild Application
+    |
+    v
+Rebuild Docker Image
+    |
+    v
+Restart Container
+    |
+    v
+Verify Service
+```
+
+This is important because simply changing Java source code does not update an already-running container.
+
+---
+
+# 13.35 Real Issue Pattern: Rebuilding All Services
+
+During multi-service development, rebuilding only one service may leave other containers running older versions.
+
+A clean rebuild workflow may involve:
+
+```text
+Stop Existing Services
+        |
+        v
+Rebuild Required Images
+        |
+        v
+Start Updated Services
+        |
+        v
+Verify Containers
+```
+
+Using Docker Compose:
+
+```bash
+docker compose down
+```
+
+Then:
+
+```bash
+docker compose up --build -d
+```
+
+Afterward:
+
+```bash
+docker compose ps
+```
+
+The exact command sequence should depend on whether persistent infrastructure data needs to be preserved.
+
+---
+
+# 13.36 Important Caution About `docker compose down`
+
+Running:
+
+```bash
+docker compose down
+```
+
+stops and removes Compose-managed containers and networks.
+
+However, persistent volumes may behave differently depending on the command and configuration.
+
+Before performing cleanup, developers should understand:
+
+```text
+Container
+```
+
+versus:
+
+```text
+Volume
+```
+
+The goal is to avoid accidentally deleting important persistent development data.
+
+For databases, data persistence should always be considered before removing resources.
+
+---
+
+# 13.37 Production Considerations
+
+Docker is useful for packaging applications, but production deployment requires more than building an image.
+
+A production container environment should consider:
+
+* Immutable image versions
+* Resource limits
+* Health checks
+* Centralized logging
+* Secrets management
+* Security scanning
+* Image vulnerability management
+* Rollback strategy
+* Monitoring
+* Horizontal scaling
+
+---
+
+# 13.38 Production Docker Image Best Practices
+
+A production image should ideally be:
+
+```text
+Small
+```
+
+```text
+Secure
+```
+
+```text
+Versioned
+```
+
+```text
+Reproducible
+```
+
+Avoid unnecessary dependencies.
+
+The image should contain what the application requires to run.
+
+---
+
+# 13.39 Multi-Stage Docker Builds
+
+A common production optimization is a multi-stage Docker build.
+
+Conceptually:
+
+```text
+Stage 1
+    |
+    v
+Build Application
+    |
+    v
+JAR
+    |
+    v
+Stage 2
+    |
+    v
+Small Runtime Image
+    |
+    v
+Run JAR
+```
+
+Example structure:
+
+```dockerfile
+FROM maven:3.9-eclipse-temurin-17 AS build
+
+WORKDIR /app
+
+COPY . .
+
+RUN mvn clean package -DskipTests
+
+FROM eclipse-temurin:17-jre
+
+WORKDIR /app
+
+COPY --from=build /app/target/*.jar app.jar
+
+ENTRYPOINT ["java", "-jar", "app.jar"]
+```
+
+This approach separates:
+
+```text
+Build Environment
+```
+
+from:
+
+```text
+Runtime Environment
+```
+
+The benefit is a potentially smaller and cleaner runtime image.
+
+If the exact CitiCore Dockerfile used a different approach, this should be treated as a production improvement/example rather than the project's exact implementation.
+
+---
+
+# 13.40 Security Considerations
+
+Containers should not contain:
+
+* Hardcoded database passwords
+* AWS credentials
+* JWT secrets
+* Production API keys
+
+Instead:
+
+```text
+Container
+    |
+    v
+Environment / Secret Injection
+```
+
+For AWS:
+
+```text
+ECS Task
+    |
+    v
+Secrets Manager
+```
+
+The container image should remain reusable across environments.
+
+---
+
+# 13.41 How Docker Connects to AWS Deployment
+
+Docker itself packages the application.
+
+AWS infrastructure runs the container.
+
+The deployment chain is:
+
+```text
+Spring Boot Application
+        |
+        v
+Dockerfile
+        |
+        v
+Docker Image
+        |
+        v
+Amazon ECR
+        |
+        v
+ECS Task Definition
+        |
+        v
+ECS / Fargate
+        |
+        v
+Running Container
+```
+
+Therefore:
+
+> Docker creates the deployment artifact, while ECS/Fargate manages and runs that artifact in AWS.
+
+This distinction is important in interviews.
+
+---
+
+# 13.42 How I Would Explain Docker in an Interview
+
+> "In CitiCore, I used Docker to containerize the Spring Boot microservices and create a consistent runtime environment. Each service was packaged as a Docker image containing the application JAR and Java runtime configuration. For local development, Docker Compose helped manage multiple services and dependencies together. The Docker images were also part of the AWS deployment flow, where images could be stored in ECR and then deployed through ECS and Fargate. One important thing I learned was Docker networking, especially that localhost inside a container refers to the container itself, so services need to use the correct Docker service or container hostname when communicating."
+
+---
+
+# 13.43 30–60 Second Interview Answer
+
+> "I used Docker in CitiCore to containerize our Spring Boot microservices. The application is first built into a JAR using Maven, and the JAR is packaged into a Docker image using a Dockerfile. For local development, Docker Compose helps run multiple services and dependencies together, including services such as MySQL, Kafka, and Redis. For AWS deployment, the Docker image acts as the deployment artifact and can be pushed to ECR and run on ECS Fargate. Docker helped us maintain consistency between local and deployment environments."
+
+---
+
+# 13.44 Interview Follow-up Questions
+
+## Q1. What is the difference between a Docker image and a container?
+
+**Answer:**
+
+A Docker image is the immutable blueprint containing the application and runtime environment. A container is a running instance created from that image.
+
+---
+
+## Q2. What is a Dockerfile?
+
+**Answer:**
+
+A Dockerfile contains instructions used to build a Docker image, such as the base image, application files, working directory, and startup command.
+
+---
+
+## Q3. Why did you use Docker in CitiCore?
+
+**Answer:**
+
+Docker allowed each Spring Boot microservice to be packaged consistently and deployed independently. It also simplified local setup and integration with AWS ECS.
+
+---
+
+## Q4. What is Docker Compose?
+
+**Answer:**
+
+Docker Compose is used to define and manage multiple related containers using a single configuration file.
+
+---
+
+## Q5. What is the problem with localhost inside Docker?
+
+**Answer:**
+
+Inside a container, localhost refers to the same container. Therefore, a service connecting to another container must usually use the correct Docker hostname or service name instead of localhost.
+
+---
+
+## Q6. How do containers communicate?
+
+**Answer:**
+
+Containers can communicate through Docker networks. Services on the same configured network can typically communicate using the appropriate service or container hostname.
+
+---
+
+## Q7. What are Docker volumes?
+
+**Answer:**
+
+Docker volumes provide persistent storage that can survive container replacement or recreation.
+
+---
+
+## Q8. What happens when a Docker container stops?
+
+**Answer:**
+
+The running process inside the container stops. The container can remain available for inspection or restart unless it is removed.
+
+---
+
+## Q9. How do you debug a Docker container?
+
+**Answer:**
+
+I first check the container status using `docker ps`, inspect logs using `docker logs`, verify port mappings, and then investigate application-level errors.
+
+---
+
+## Q10. What is a multi-stage Docker build?
+
+**Answer:**
+
+It separates the build environment from the runtime environment. For example, one stage builds the Spring Boot JAR and another smaller stage runs only the final application artifact.
+
+---
+
+## Q11. How does Docker fit into CI/CD?
+
+**Answer:**
+
+The pipeline builds the application, creates a Docker image, tags it, pushes it to a container registry, and deploys that image to the container platform.
+
+---
+
+## Q12. How would you roll back a Docker-based deployment?
+
+**Answer:**
+
+I would redeploy a previously known stable image version. This is why immutable versioned image tags are important.
+
+---
+
+# 13.45 Key Takeaways
+
+Docker provides the containerization layer for CitiCore.
+
+The main flow is:
+
+```text
+Java Code
+    |
+    v
+Maven Build
+    |
+    v
+JAR
+    |
+    v
+Docker Image
+    |
+    v
+Docker Container
+```
+
+For multiple services:
+
+```text
+Docker Compose
+    |
+    +-- Microservices
+    |
+    +-- MySQL
+    |
+    +-- Kafka
+    |
+    +-- Redis
+```
+
+For AWS deployment:
+
+```text
+Docker Image
+     |
+     v
+ECR
+     |
+     v
+ECS / Fargate
+     |
+     v
+Running CitiCore Service
+```
+
+The most important practical concepts are:
+
+* Image vs Container
+* Dockerfile
+* Port Mapping
+* Docker Networking
+* `localhost` behavior inside containers
+* Volumes
+* Docker Compose
+* Rebuilding images
+* Container logs
+* Image tagging
+* CI/CD integration
+
+---
+
+# 13.46 Final Docker Architecture Summary
+
+```text
+                 CITICORE DEVELOPMENT
+
+Spring Boot Services
+        |
+        v
+     Maven Build
+        |
+        v
+   Application JAR
+        |
+        v
+     Docker Build
+        |
+        v
+     Docker Image
+        |
+        +-----------------------------+
+        |                             |
+        v                             v
+Local Docker Environment         AWS Deployment
+        |                             |
+        v                             v
+Docker Compose                       ECR
+        |                             |
+        +-- Services                  v
+        +-- MySQL                    ECS
+        +-- Kafka                     |
+        +-- Redis                     v
+                                  Fargate
+                                      |
+                                      v
+                               Running Containers
+```
+
+> **Docker is the packaging and runtime standardization layer that allows CitiCore microservices to run consistently in local development and cloud deployment environments.**
+
+---
+
+## TOPIC- 14. AWS CONTAINER DEPLOYMENT
+
+## 14.1 What Is AWS Container Deployment?
+
+AWS container deployment is the process of taking a containerized application and running it on AWS infrastructure.
+
+In CitiCore, the deployment flow connects several services:
+
+* Docker
+* Amazon ECR
+* Amazon ECS
+* AWS Fargate
+* ECS Task Definitions
+* ECS Services
+* Application Load Balancer
+* Target Groups
+* ECS Service Connect
+* CloudWatch
+* IAM
+* Security Groups
+
+The overall deployment path is:
+
+```text
+Spring Boot Application
+        |
+        v
+Maven Build
+        |
+        v
+Application JAR
+        |
+        v
+Docker Image
+        |
+        v
+Amazon ECR
+        |
+        v
+ECS Task Definition
+        |
+        v
+ECS Service
+        |
+        v
+AWS Fargate Task
+        |
+        +----------------------+
+        |                      |
+        v                      v
+      ALB              Service Connect
+   External Traffic    Internal Traffic
+```
+
+The important distinction is:
+
+> **Docker packages the application. ECR stores the image. ECS manages the deployment. Fargate runs the container.**
+
+---
+
+# 14.2 Why Do We Need AWS Container Deployment?
+
+Running a Docker container locally is useful for development, but a production-style environment needs additional capabilities.
+
+For example:
+
+```text
+Developer Machine
+        |
+        v
+docker run
+        |
+        v
+Application Running
+```
+
+This approach does not automatically provide:
+
+* High availability
+* Container orchestration
+* Automatic replacement of failed containers
+* Load balancing
+* Managed networking
+* Centralized logging
+* IAM-based permissions
+* Cloud deployment
+* Deployment management
+
+AWS ECS and Fargate provide a managed way to run containerized applications.
+
+For CitiCore:
+
+```text
+Docker Image
+      |
+      v
+AWS Cloud
+      |
+      v
+ECS Service
+      |
+      v
+Fargate Tasks
+```
+
+This allows the microservices to run without manually managing individual servers for every container.
+
+---
+
+# 14.3 CitiCore Context
+
+## CitiCore Implementation
+
+CitiCore uses a container-based deployment architecture on AWS.
+
+The implementation follows this general flow:
+
+```text
+Local Development
+        |
+        v
+Spring Boot Application
+        |
+        v
+Docker Image
+        |
+        v
+Amazon ECR
+        |
+        v
+ECS Cluster
+        |
+        v
+ECS Service
+        |
+        v
+Fargate Task
+```
+
+The deployed environment includes infrastructure such as:
+
+```text
+AWS
+ |
+ +-- VPC
+ |
+ +-- Subnets
+ |
+ +-- Security Groups
+ |
+ +-- ECR
+ |
+ +-- ECS Cluster
+ |      |
+ |      +-- ECS Services
+ |              |
+ |              +-- Fargate Tasks
+ |
+ +-- ALB
+ |
+ +-- Service Connect
+ |
+ +-- CloudWatch
+ |
+ +-- IAM
+```
+
+The architecture separates different responsibilities.
+
+```text
+ECR
+ |
+ | Stores
+ v
+Container Images
+
+
+ECS
+ |
+ | Orchestrates
+ v
+Containers
+
+
+Fargate
+ |
+ | Provides
+ v
+Container Runtime
+
+
+ALB
+ |
+ | Routes
+ v
+External HTTP Traffic
+
+
+Service Connect
+ |
+ | Enables
+ v
+Internal Service Communication
+```
+
+---
+
+# 14.4 High-Level CitiCore Deployment Architecture
+
+A simplified architecture is:
+
+```text
+                         Internet
+                            |
+                            v
+                   Application Load Balancer
+                            |
+                            v
+                    ECS Target Group
+                            |
+                            v
+                  +----------------------+
+                  |    ECS Fargate       |
+                  |                      |
+                  |  API / Application   |
+                  |       Service        |
+                  +----------------------+
+                            |
+                            |
+          +-----------------+------------------+
+          |                 |                  |
+          v                 v                  v
+   Service Connect       Amazon RDS          Kafka
+   Internal Services
+```
+
+Container images are supplied through ECR.
+
+```text
+Developer / Jenkins
+        |
+        v
+Build Docker Image
+        |
+        v
+Amazon ECR
+        |
+        v
+ECS Task Pulls Image
+        |
+        v
+Fargate Runs Container
+```
+
+---
+
+# 14.5 Deployment Order
+
+Deployment order is important in a microservices environment because some services depend on infrastructure or other platform components.
+
+The documented CitiCore deployment order follows the dependency chain:
+
+```text
+AWS Infrastructure
+        |
+        v
+Config Server
+        |
+        v
+Eureka Server
+        |
+        v
+Application Services
+        |
+        +-- Auth Service
+        +-- User Service
+        +-- Account Service
+        +-- Transaction Service
+        +-- Notification Service
+        |
+        v
+API Gateway
+```
+
+Supporting infrastructure such as databases, Kafka, Redis, networking, and security configuration must also be available.
+
+The principle is:
+
+> Deploy dependencies before the services that require them.
+
+For example:
+
+```text
+Auth Service
+     |
+     +--> Config Server
+     |
+     +--> Eureka
+     |
+     +--> Database
+     |
+     +--> Kafka
+```
+
+If a dependency is unavailable, startup or runtime communication can fail.
+
+---
+
+# 14.6 Why Deployment Order Matters
+
+Consider deploying a service before its dependencies are ready.
+
+```text
+Auth Service Starts
+       |
+       v
+Requests Configuration
+       |
+       X
+Config Server Unavailable
+```
+
+Or:
+
+```text
+Auth Service Starts
+       |
+       v
+Attempts Eureka Registration
+       |
+       X
+Eureka Unavailable
+```
+
+This can cause:
+
+* Startup failures
+* Retry loops
+* Registration failures
+* Service discovery failures
+* Runtime errors
+
+A better sequence is:
+
+```text
+Infrastructure Ready
+        |
+        v
+Config Server Ready
+        |
+        v
+Eureka Ready
+        |
+        v
+Application Services
+```
+
+However, production systems should not rely only on deployment order. Applications should also handle temporary dependency failures using:
+
+* Retries
+* Timeouts
+* Health checks
+* Graceful startup behavior
+* Circuit breakers where appropriate
+
+---
+
+# 14.7 Amazon ECR
+
+## What Is Amazon ECR?
+
+Amazon Elastic Container Registry (ECR) is a managed container image registry.
+
+In CitiCore, ECR stores Docker images before ECS deploys them.
+
+The flow is:
+
+```text
+Docker Build
+     |
+     v
+Docker Image
+     |
+     v
+Push Image
+     |
+     v
+Amazon ECR
+     |
+     v
+ECS Pulls Image
+```
+
+For example:
+
+```text
+Account Service
+      |
+      v
+Docker Image
+      |
+      v
+ECR Repository
+      |
+      v
+ECS Task Definition
+      |
+      v
+Fargate Task
+```
+
+---
+
+# 14.8 Why ECR Is Needed
+
+Without a container registry:
+
+```text
+Developer Machine
+      |
+      v
+Docker Image
+```
+
+The AWS runtime would not have a managed source from which to retrieve the image.
+
+ECR provides:
+
+* Image storage
+* AWS integration
+* IAM-based access
+* Image versioning through tags
+* Integration with ECS
+
+The important deployment relationship is:
+
+```text
+Git Commit
+     |
+     v
+Git SHA
+     |
+     v
+Docker Image Tag
+     |
+     v
+ECR Image
+     |
+     v
+ECS Task Definition
+```
+
+This provides deployment traceability.
+
+---
+
+# 14.9 Building a Docker Image
+
+The application must first be packaged.
+
+For a Spring Boot service:
+
+```text
+Java Source Code
+       |
+       v
+Maven Build
+       |
+       v
+JAR File
+       |
+       v
+Docker Build
+       |
+       v
+Docker Image
+```
+
+Example:
+
+```bash
+mvn clean package
+```
+
+Then:
+
+```bash
+docker build -t citicore-account-service .
+```
+
+The exact image name depends on the service and repository structure.
+
+---
+
+# 14.10 ECR Authentication
+
+Before pushing an image to ECR, Docker must authenticate with the registry.
+
+A typical AWS CLI flow is:
+
+```bash
+aws ecr get-login-password \
+  --region ap-south-1
+```
+
+The password is then passed to Docker login.
+
+Conceptually:
+
+```text
+AWS CLI
+    |
+    v
+Temporary Authentication Token
+    |
+    v
+Docker Login
+    |
+    v
+Authorized to Push Image
+```
+
+This is normally automated in CI/CD rather than manually performed for every deployment.
+
+---
+
+# 14.11 Tagging Images
+
+Docker images should be tagged with meaningful versions.
+
+For example:
+
+```text
+account-service:latest
+```
+
+Using only `latest` creates ambiguity because it does not clearly identify the deployed application version.
+
+CitiCore's CI/CD notes use Git SHA-based tagging.
+
+Example:
+
+```text
+account-service:434a66ea...
+```
+
+The exact SHA depends on the Git commit.
+
+The relationship is:
+
+```text
+Git Commit
+    |
+    v
+Commit SHA
+    |
+    v
+Docker Image Tag
+```
+
+This makes it easier to answer:
+
+> Which source code version is currently deployed?
+
+The deployment can be traced through the SHA.
+
+---
+
+# 14.12 Why Git SHA Image Tagging Is Important
+
+Suppose two application versions exist.
+
+```text
+Version A
+    |
+    v
+account-service:25951ba...
+```
+
+```text
+Version B
+    |
+    v
+account-service:434a66e...
+```
+
+If Version B causes a problem, the previous version can be identified clearly.
+
+```text
+Current Version
+      |
+      v
+434a66e
+      |
+      X
+Problem
+      |
+      v
+Rollback
+      |
+      v
+25951ba
+```
+
+This provides:
+
+* Traceability
+* Reproducibility
+* Easier rollback
+* Clear deployment history
+
+---
+
+# 14.13 Pushing an Image to ECR
+
+The deployment flow is:
+
+```text
+Local Docker Image
+        |
+        v
+Tag With ECR Repository URI
+        |
+        v
+Push to ECR
+        |
+        v
+Image Available to ECS
+```
+
+Conceptually:
+
+```text
+Developer / Jenkins
+       |
+       v
+Docker Image
+       |
+       v
+Amazon ECR
+       |
+       v
+ECS Pulls Image
+```
+
+The exact repository URI should be environment-specific and should not be hardcoded into application source code.
+
+---
+
+# 14.14 ECS Task Definition
+
+## What Is an ECS Task Definition?
+
+An ECS Task Definition is a deployment blueprint that describes how a container should run.
+
+It can define:
+
+* Docker image
+* CPU
+* Memory
+* Container port
+* Environment variables
+* Secrets
+* Logging
+* IAM roles
+* Network configuration
+
+Conceptually:
+
+```text
+ECR Image
+    |
+    v
+Task Definition
+    |
+    +-- Image
+    +-- CPU
+    +-- Memory
+    +-- Port
+    +-- Environment
+    +-- Secrets
+    +-- Logging
+    |
+    v
+Fargate Task
+```
+
+A Task Definition does not itself run the application.
+
+It defines **how ECS should run it**.
+
+---
+
+# 14.15 Task Definition in CitiCore
+
+A simplified CitiCore task flow is:
+
+```text
+CitiCore Service Image
+        |
+        v
+ECS Task Definition
+        |
+        +----------------------+
+        |                      |
+        | Container Image      |
+        | CPU                  |
+        | Memory               |
+        | Port                 |
+        | Logs                 |
+        | IAM                  |
+        +----------------------+
+        |
+        v
+ECS Fargate Task
+```
+
+When a new application version is deployed, a new task definition revision may be created.
+
+Example:
+
+```text
+Task Definition Revision 23
+        |
+        v
+Old Application Image
+```
+
+After deployment:
+
+```text
+Task Definition Revision 24
+        |
+        v
+New Application Image
+```
+
+The ECS service can then be updated to use the new revision.
+
+---
+
+# 14.16 ECS Task Definition Revision
+
+Task definitions are revisioned.
+
+The relationship is:
+
+```text
+Task Definition
+      |
+      +-- Revision 1
+      |
+      +-- Revision 2
+      |
+      +-- Revision 3
+      |
+      +-- Revision N
+```
+
+Each deployment can create a new revision when configuration or image details change.
+
+This provides deployment history.
+
+For example:
+
+```text
+Old Image
+    |
+    v
+Task Definition Revision 15
+```
+
+```text
+New Image
+    |
+    v
+Task Definition Revision 16
+```
+
+The ECS service is then updated to use the desired revision.
+
+---
+
+# 14.17 ECS Service
+
+## What Is an ECS Service?
+
+An ECS Service manages the long-running tasks for an application.
+
+For CitiCore:
+
+```text
+ECS Cluster
+     |
+     v
+ECS Service
+     |
+     v
+Desired Number of Tasks
+```
+
+For example:
+
+```text
+Desired Count = 1
+```
+
+ECS attempts to maintain:
+
+```text
+Running Tasks = 1
+```
+
+If a task fails:
+
+```text
+Task Stops
+    |
+    v
+ECS Detects Desired Count Not Met
+    |
+    v
+Replacement Task Started
+```
+
+This is one of the main benefits of using an ECS Service rather than manually running a single container.
+
+---
+
+# 14.18 ECS Service and Fargate Tasks
+
+The hierarchy is:
+
+```text
+ECS Cluster
+     |
+     v
+ECS Service
+     |
+     v
+Fargate Task
+     |
+     v
+Docker Container
+     |
+     v
+Spring Boot Application
+```
+
+Each layer has a different responsibility.
+
+### ECS Cluster
+
+Logical grouping for ECS services and workloads.
+
+### ECS Service
+
+Maintains the desired number of running tasks.
+
+### Fargate Task
+
+The running task environment.
+
+### Container
+
+Runs the application process.
+
+---
+
+# 14.19 What Is AWS Fargate?
+
+AWS Fargate is a serverless compute engine for containers.
+
+Instead of manually managing EC2 instances:
+
+```text
+Developer
+    |
+    v
+Manage EC2
+    |
+    +-- OS
+    +-- Capacity
+    +-- Patching
+    +-- Container Runtime
+```
+
+Fargate abstracts much of the underlying infrastructure management.
+
+The application flow becomes:
+
+```text
+ECS Service
+     |
+     v
+Fargate
+     |
+     v
+Container Runs
+```
+
+In CitiCore, Fargate is used to run containerized services without manually managing the container host servers.
+
+---
+
+# 14.20 Why CitiCore Uses ECS with Fargate
+
+The main advantages are:
+
+* No direct server management
+* Integration with ECR
+* Integration with IAM
+* Integration with VPC
+* Integration with ALB
+* Integration with CloudWatch
+* ECS Service management
+* Easier container deployment
+
+The deployment model is:
+
+```text
+Docker Image
+      |
+      v
+Amazon ECR
+      |
+      v
+ECS
+      |
+      v
+Fargate
+      |
+      v
+Running Container
+```
+
+---
+
+# 14.21 Environment Variables
+
+Applications often require environment-specific configuration.
+
+Examples include:
+
+* Active profile
+* Database host
+* Kafka configuration
+* Redis configuration
+* Service configuration
+
+A container image should ideally remain reusable across environments.
+
+Instead of:
+
+```text
+Development Docker Image
+```
+
+and:
+
+```text
+Production Docker Image
+```
+
+a better principle is:
+
+```text
+Same Application Image
+        |
+        +------------------+
+        |                  |
+        v                  v
+Development Config    Production Config
+```
+
+This separates:
+
+```text
+Application Artifact
+```
+
+from:
+
+```text
+Environment Configuration
+```
+
+---
+
+# 14.22 Secrets
+
+Sensitive values should not be stored directly inside:
+
+* Source code
+* Docker images
+* Git repositories
+
+Examples include:
+
+* Database passwords
+* JWT secrets
+* API keys
+* AWS credentials
+
+The architecture should be:
+
+```text
+Application Container
+        |
+        v
+AWS Secret / Secure Configuration
+```
+
+For CitiCore, credential and database security are covered in the dedicated Database Security section.
+
+The key deployment principle is:
+
+> Secrets should be injected securely into the running environment rather than baked into the Docker image.
+
+---
+
+# 14.23 IAM Roles
+
+ECS deployments require AWS permissions.
+
+Two important concepts are commonly involved:
+
+```text
+ECS Task Execution Role
+```
+
+and:
+
+```text
+Application Task Role
+```
+
+Conceptually:
+
+```text
+ECS Task
+   |
+   +------------------------+
+   |                        |
+   v                        v
+Execution Role           Task Role
+```
+
+### Execution Role
+
+Used by ECS for operations required to start and manage the task, such as accessing container images and logging integrations.
+
+### Task Role
+
+Represents permissions available to the application running inside the task.
+
+The important security principle is:
+
+> Give each role only the permissions required for its responsibility.
+
+---
+
+# 14.24 Networking During Deployment
+
+A Fargate task runs inside the AWS networking environment.
+
+The relationship is:
+
+```text
+VPC
+ |
+ v
+Subnet
+ |
+ v
+ECS Task
+ |
+ v
+Network Interface
+ |
+ v
+Security Group
+```
+
+The task's network configuration determines how it communicates with:
+
+* ALB
+* RDS
+* Kafka
+* Redis
+* Other ECS services
+* Internet-facing dependencies
+
+The detailed VPC architecture is covered in Topic 12.
+
+Here, the deployment perspective is:
+
+```text
+ECS Task
+   |
+   +--> Security Group Rules
+   |
+   +--> Subnet
+   |
+   +--> Network Connectivity
+```
+
+---
+
+# 14.25 Application Load Balancer
+
+## Purpose
+
+The Application Load Balancer handles external HTTP traffic.
+
+The simplified flow is:
+
+```text
+Client
+   |
+   v
+Application Load Balancer
+   |
+   v
+Target Group
+   |
+   v
+ECS Fargate Task
+   |
+   v
+Spring Boot Application
+```
+
+The ALB should not be confused with internal service discovery.
+
+External traffic:
+
+```text
+Internet
+    |
+    v
+ALB
+    |
+    v
+Application Service
+```
+
+Internal service communication can use:
+
+```text
+Service Connect
+```
+
+and application-level service discovery mechanisms such as:
+
+```text
+Eureka
+```
+
+These technologies solve different problems.
+
+---
+
+# 14.26 Target Groups
+
+A target group represents the backend targets that receive traffic from the ALB.
+
+For ECS/Fargate:
+
+```text
+ALB
+ |
+ v
+Target Group
+ |
+ +-------------------+
+ |                   |
+ v                   v
+Fargate Task     Fargate Task
+```
+
+The target group performs health checks.
+
+Healthy targets can receive traffic.
+
+```text
+Health Check
+     |
+     +------------------+
+     |                  |
+ Healthy            Unhealthy
+     |                  |
+     v                  X
+Receive Traffic    Removed from Routing
+```
+
+---
+
+# 14.27 Health Checks
+
+Health checks are critical during deployment.
+
+A container being:
+
+```text
+RUNNING
+```
+
+does not automatically mean the application is healthy.
+
+Different layers must be considered.
+
+```text
+Layer 1
+Container Running
+```
+
+```text
+Layer 2
+Application Started
+```
+
+```text
+Layer 3
+Health Endpoint Responding
+```
+
+```text
+Layer 4
+ALB Target Healthy
+```
+
+```text
+Layer 5
+Business Function Working
+```
+
+These are separate states.
+
+The CitiCore notes highlighted this distinction during troubleshooting.
+
+A system may have:
+
+```text
+ECS Task = RUNNING
+```
+
+and:
+
+```text
+ALB Target = HEALTHY
+```
+
+while a business operation still has a problem.
+
+Therefore:
+
+> Infrastructure health and business correctness must be verified separately.
+
+---
+
+# 14.28 Spring Boot Health Endpoint
+
+A typical health verification flow is:
+
+```text
+ECS Task
+    |
+    v
+Spring Boot Application
+    |
+    v
+/actuator/health
+    |
+    v
+Health Response
+```
+
+For CitiCore, health checks were used as part of verifying deployed services.
+
+A typical successful response is:
+
+```text
+HTTP 200
+```
+
+with the application reporting an available health state.
+
+The exact Actuator configuration should match the active service configuration.
+
+---
+
+# 14.29 ALB Health Check Flow
+
+The deployment health flow is:
+
+```text
+ALB
+ |
+ v
+Target Group
+ |
+ v
+Health Check Request
+ |
+ v
+Fargate Task
+ |
+ v
+Spring Boot Health Endpoint
+```
+
+If successful:
+
+```text
+Target = Healthy
+```
+
+Then:
+
+```text
+ALB
+ |
+ v
+Routes Client Traffic
+ |
+ v
+Healthy Task
+```
+
+If unhealthy:
+
+```text
+Target = Unhealthy
+```
+
+The target should not be considered a healthy destination for normal traffic.
+
+---
+
+# 14.30 ECS Service Connect
+
+## What Is Service Connect?
+
+ECS Service Connect provides service-to-service connectivity and discovery capabilities for services running in ECS.
+
+The simplified flow is:
+
+```text
+Service A
+   |
+   v
+Service Connect Name
+   |
+   v
+Service B
+```
+
+This avoids hardcoding temporary task IP addresses.
+
+Without service discovery:
+
+```text
+Service A
+   |
+   v
+Hardcoded Task IP
+```
+
+This is unreliable because Fargate task IP addresses can change.
+
+With Service Connect:
+
+```text
+Service A
+   |
+   v
+Stable Service Name
+   |
+   v
+Service B
+```
+
+---
+
+# 14.31 Service Connect in CitiCore
+
+The CitiCore architecture includes ECS Service Connect for internal ECS communication.
+
+The notes describe the architecture as:
+
+```text
+Microservice
+     |
+     v
+Service Connect DNS
+     |
+     v
+Another ECS Service
+```
+
+This is particularly useful because container tasks are dynamic.
+
+The key principle is:
+
+> Never rely on ephemeral Fargate task IP addresses for service-to-service communication.
+
+---
+
+# 14.32 Eureka vs Service Connect in Deployment
+
+CitiCore contains both:
+
+```text
+ECS Service Connect
+```
+
+and:
+
+```text
+Eureka
+```
+
+They operate at different layers.
+
+```text
+Infrastructure-Level Service Connectivity
+                |
+                v
+       ECS Service Connect
+```
+
+```text
+Application-Level Service Registry
+                |
+                v
+              Eureka
+```
+
+The deployment architecture can therefore be understood as:
+
+```text
+ECS Layer
+    |
+    +--> Service Connect
+    |
+    +--> Networking
+    |
+    +--> Task Management
+
+
+Application Layer
+    |
+    +--> Eureka
+    |
+    +--> Spring Cloud
+    |
+    +--> Service Discovery
+```
+
+This distinction is useful during interviews.
+
+---
+
+# 14.33 ECS Deployment Flow
+
+The general deployment process is:
+
+```text
+1. Build Application
+        |
+        v
+2. Build Docker Image
+        |
+        v
+3. Push Image to ECR
+        |
+        v
+4. Update Task Definition
+        |
+        v
+5. Register New Revision
+        |
+        v
+6. Update ECS Service
+        |
+        v
+7. ECS Starts New Task
+        |
+        v
+8. Health Checks
+        |
+        v
+9. New Task Receives Traffic
+        |
+        v
+10. Old Task Stops
+```
+
+This is the core deployment lifecycle for CitiCore's container-based services.
+
+---
+
+# 14.34 Rolling Deployment
+
+When a new version is deployed:
+
+```text
+Old Version
+     |
+     v
+Running ECS Task
+```
+
+A new task definition is registered:
+
+```text
+New Version
+     |
+     v
+New ECS Task Definition
+```
+
+Then:
+
+```text
+ECS Service Update
+        |
+        v
+Start New Task
+        |
+        v
+Health Check
+        |
+        v
+Route Traffic
+        |
+        v
+Drain Old Task
+        |
+        v
+Stop Old Task
+```
+
+This is the general rolling deployment concept used by ECS services.
+
+The exact deployment behavior depends on the ECS deployment configuration.
+
+---
+
+# 14.35 CitiCore Deployment Example
+
+A documented CitiCore deployment flow follows this pattern:
+
+```text
+Code Change
+    |
+    v
+Git Commit
+    |
+    v
+Jenkins Triggered
+    |
+    v
+Maven Build
+    |
+    v
+Docker Build
+    |
+    v
+Git SHA Image Tag
+    |
+    v
+Push Image to ECR
+    |
+    v
+Register ECS Task Definition Revision
+    |
+    v
+Update ECS Service
+    |
+    v
+ECS Rolling Deployment
+```
+
+For example:
+
+```text
+Account Service Changed
+        |
+        v
+Build New Account Service Image
+        |
+        v
+Push to ECR
+        |
+        v
+Register New Task Definition Revision
+        |
+        v
+Update Account ECS Service
+```
+
+The CI/CD automation details are covered separately in Topic 15.
+
+---
+
+# 14.36 Deployment Verification
+
+A deployment should not be considered successful immediately after an update command is sent.
+
+Multiple layers should be verified.
+
+## ECS Service
+
+```text
+Desired Count
+```
+
+should match the expected deployment configuration.
+
+```text
+Running Count
+```
+
+should reach the desired state.
+
+```text
+Pending Count
+```
+
+should eventually reach zero when the deployment stabilizes.
+
+---
+
+## Task Definition
+
+Verify that the ECS service points to the expected task definition revision.
+
+Conceptually:
+
+```text
+Expected Task Definition
+          |
+          v
+ECS Service
+          |
+          v
+Actual Task Definition
+```
+
+These should match.
+
+---
+
+## Target Health
+
+Verify the ALB target group.
+
+```text
+ALB
+ |
+ v
+Target Group
+ |
+ v
+Target Health
+```
+
+The target should become healthy before it is considered ready for traffic.
+
+---
+
+## Application Health
+
+Verify:
+
+```text
+/actuator/health
+```
+
+The service should respond successfully.
+
+---
+
+## Logs
+
+Check:
+
+```text
+CloudWatch Logs
+```
+
+Look for:
+
+* Startup failures
+* Dependency connection errors
+* Configuration errors
+* Application exceptions
+
+---
+
+# 14.37 Important Deployment Checklist
+
+## Before Deployment
+
+```text
+[ ] Application builds successfully
+[ ] Tests pass
+[ ] Docker image builds successfully
+[ ] Correct image tag created
+[ ] ECR authentication works
+[ ] Image pushed successfully
+```
+
+## ECS Deployment
+
+```text
+[ ] Task definition registered
+[ ] Correct image referenced
+[ ] ECS service updated
+[ ] Desired count correct
+[ ] New task starts
+```
+
+## Networking
+
+```text
+[ ] Correct VPC
+[ ] Correct subnets
+[ ] Security groups configured
+[ ] ALB reachable where required
+[ ] Target group configured
+```
+
+## Health
+
+```text
+[ ] ECS task running
+[ ] Target healthy
+[ ] /actuator/health works
+[ ] CloudWatch logs reviewed
+```
+
+## Dependencies
+
+```text
+[ ] Config Server reachable
+[ ] Eureka reachable
+[ ] Database connectivity verified
+[ ] Kafka connectivity verified
+[ ] Redis connectivity verified
+```
+
+---
+
+# 14.38 Failure Handling During Deployment
+
+Deployment failures can happen at different stages.
+
+```text
+Build Failure
+    |
+    v
+No Image
+```
+
+```text
+Image Push Failure
+    |
+    v
+No New Image in ECR
+```
+
+```text
+Task Startup Failure
+    |
+    v
+Application Does Not Run
+```
+
+```text
+Health Check Failure
+    |
+    v
+Target Remains Unhealthy
+```
+
+```text
+Runtime Failure
+    |
+    v
+Business Operation Fails
+```
+
+Each layer should be investigated separately.
+
+---
+
+# 14.39 Real CitiCore Troubleshooting Lesson
+
+A major lesson documented during CitiCore deployment was:
+
+> An HTTP timeout does not necessarily mean the business operation failed.
+
+The troubleshooting evidence showed a situation where a registration request appeared to time out, but subsequent behavior indicated that the database write had completed.
+
+Conceptually:
+
+```text
+Client Request
+      |
+      v
+Business Operation Starts
+      |
+      v
+Database Write Completes
+      |
+      v
+Downstream Operation Delayed
+      |
+      v
+Client Timeout
+```
+
+The client may see:
+
+```text
+504 Timeout
+```
+
+but the business operation may already have partially or fully completed.
+
+The investigation should compare:
+
+```text
+Client Response
+        +
+Application Logs
+        +
+Database State
+        +
+Downstream Service State
+        +
+ALB Status
+        +
+Network / DNS
+```
+
+This is an important distributed-systems lesson.
+
+---
+
+# 14.40 Deployment Layer Mental Model
+
+CitiCore deployment can be understood in layers.
+
+## Layer 1 — Container
+
+```text
+Docker Image
+      |
+      v
+Fargate Container
+```
+
+## Layer 2 — ECS
+
+```text
+Task Definition
+      |
+      v
+ECS Service
+      |
+      v
+Fargate Task
+```
+
+## Layer 3 — Network
+
+```text
+VPC
+ |
+ v
+Subnet
+ |
+ v
+Network Interface
+ |
+ v
+Security Group
+```
+
+## Layer 4 — External Traffic
+
+```text
+Internet
+ |
+ v
+ALB
+ |
+ v
+Target Group
+ |
+ v
+Fargate Task
+```
+
+## Layer 5 — Internal Traffic
+
+```text
+Service
+ |
+ v
+Service Connect
+ |
+ v
+Another Service
+```
+
+## Layer 6 — Application Discovery
+
+```text
+Microservice
+ |
+ v
+Eureka
+ |
+ v
+Service Registry
+```
+
+## Layer 7 — Configuration
+
+```text
+Configuration Repository
+ |
+ v
+Config Server
+ |
+ v
+Microservices
+```
+
+## Layer 8 — Events
+
+```text
+Microservice
+ |
+ v
+Kafka
+ |
+ v
+Consumer Service
+```
+
+This layered model is useful when debugging because it prevents treating the entire system as a single component.
+
+---
+
+# 14.41 Rollback
+
+Rollback means returning the service to a previously known stable application version.
+
+CitiCore uses versioned Docker images and deployment history to support rollback.
+
+The basic process is:
+
+```text
+New Deployment
+      |
+      v
+Problem Detected
+      |
+      v
+Identify Known-Good Version
+      |
+      v
+Verify Image Exists in ECR
+      |
+      v
+Deploy Previous Version
+      |
+      v
+Verify ECS Service
+      |
+      v
+Verify Application
+```
+
+The Git SHA-based tagging strategy is important here.
+
+```text
+Known-Good Commit
+        |
+        v
+Known-Good Image Tag
+        |
+        v
+Image in ECR
+        |
+        v
+Redeploy
+```
+
+---
+
+# 14.42 CitiCore Rollback Approach
+
+The documented CitiCore approach uses a manual rollback process through Jenkins.
+
+The general flow is:
+
+```text
+Deployment Issue
+       |
+       v
+Operator Investigation
+       |
+       v
+Identify Previous Stable Git SHA
+       |
+       v
+Verify ECR Image
+       |
+       v
+Trigger Rollback
+       |
+       v
+Deploy Previous Image
+       |
+       v
+Verify ECS
+       |
+       v
+Test API
+```
+
+The documented reasoning for manual rollback is that rollback should be a deliberate operational decision rather than blindly switching versions.
+
+This provides:
+
+* Human verification
+* Controlled recovery
+* Better incident investigation
+* Clear audit trail
+
+The complete Jenkins implementation is covered in Topic 15.
+
+---
+
+# 14.43 Health Verification vs Deployment Trigger
+
+An important distinction in the CitiCore pipeline is:
+
+```text
+Deployment Triggered
+```
+
+is not the same as:
+
+```text
+Deployment Fully Stable
+```
+
+The pipeline can verify that:
+
+```text
+ECS Service
+    |
+    v
+Points to Expected Task Definition
+```
+
+while ECS continues the rolling deployment asynchronously.
+
+The stages are:
+
+```text
+Pipeline
+   |
+   v
+Register Task Definition
+   |
+   v
+Update ECS Service
+   |
+   v
+ECS Accepts New Revision
+   |
+   v
+Pipeline Verifies Request
+```
+
+Then ECS continues:
+
+```text
+Start New Task
+   |
+   v
+Application Startup
+   |
+   v
+Health Checks
+   |
+   v
+Traffic Transition
+   |
+   v
+Old Task Drained
+```
+
+This distinction prevents incorrectly assuming that a successful API call to ECS means the entire deployment lifecycle has already completed.
+
+---
+
+# 14.44 Production Considerations
+
+A real production deployment should consider more than simply starting containers.
+
+Important areas include:
+
+## High Availability
+
+Run appropriate service replicas across available infrastructure.
+
+```text
+ALB
+ |
+ +-------------------+
+ |                   |
+ v                   v
+Task 1             Task 2
+```
+
+The exact scaling configuration should depend on actual workload requirements.
+
+---
+
+## Health Checks
+
+Use meaningful health checks.
+
+```text
+Container Running
+```
+
+alone is not enough.
+
+---
+
+## Logging
+
+Centralize logs.
+
+```text
+Fargate Task
+     |
+     v
+CloudWatch Logs
+```
+
+Logs should support investigation of:
+
+* Startup failures
+* Application exceptions
+* Dependency failures
+
+---
+
+## Secrets
+
+Sensitive credentials should be securely managed.
+
+```text
+Application
+    |
+    v
+Secure Secret Source
+```
+
+They should not be baked into images.
+
+---
+
+## Image Versioning
+
+Avoid ambiguous production deployment versions.
+
+Prefer:
+
+```text
+service:<immutable-version>
+```
+
+over relying only on:
+
+```text
+service:latest
+```
+
+---
+
+## Rollback
+
+A previously known-good version should be identifiable and deployable.
+
+---
+
+# 14.45 Trade-offs
+
+## Advantages of ECS/Fargate
+
+### Reduced Server Management
+
+The team does not need to manually manage container host servers.
+
+### AWS Integration
+
+It integrates with:
+
+* ECR
+* IAM
+* VPC
+* ALB
+* CloudWatch
+
+### Service Management
+
+ECS services maintain desired task counts.
+
+### Container-Based Deployment
+
+Each microservice can be independently packaged and deployed.
+
+---
+
+## Disadvantages
+
+### AWS-Specific Operational Knowledge
+
+Teams need to understand:
+
+* ECS
+* IAM
+* Networking
+* Task definitions
+* Security groups
+* Load balancers
+
+### Deployment Complexity
+
+A microservices environment contains multiple deployment layers.
+
+```text
+Application
+   |
+Docker
+   |
+ECR
+   |
+ECS
+   |
+Network
+   |
+ALB
+   |
+Dependencies
+```
+
+### Debugging Across Layers
+
+A problem may exist in:
+
+* Application code
+* Container configuration
+* ECS configuration
+* Security groups
+* DNS
+* ALB
+* Service Connect
+
+This requires a structured troubleshooting approach.
+
+---
+
+# 14.46 How I Would Explain AWS Container Deployment in an Interview
+
+> "For CitiCore, I containerized the Spring Boot microservices using Docker and deployed them on AWS ECS with Fargate. The application is first packaged as a JAR, then built into a Docker image. The image is stored in Amazon ECR. ECS uses a task definition to define how the container should run, including the image, resources, ports, logging, and environment configuration. An ECS service manages the running tasks, while Fargate provides the serverless container runtime. For external traffic, we use an Application Load Balancer and target groups with health checks. For internal ECS communication, the architecture also uses Service Connect. Our deployment flow uses versioned images and ECS task definition revisions, which also supports controlled rollback."
+
+---
+
+# 14.47 30–60 Second Interview Answer
+
+> "In CitiCore, the deployment flow starts with building the Spring Boot service using Maven and packaging it into a Docker image. The image is tagged with a Git SHA for traceability and pushed to Amazon ECR. We then use ECS task definitions to specify the container image and runtime configuration, and ECS services run the containers on Fargate. External traffic goes through an ALB and target group, while health checks verify that the service is ready. The deployment uses new task definition revisions, and previous versioned images can be used for rollback."
+
+---
+
+# 14.48 Interview Follow-up Questions
+
+## Q1. What is the difference between ECR and ECS?
+
+**Answer:**
+
+ECR is a container image registry used to store Docker images. ECS is a container orchestration service used to deploy and manage containers.
+
+```text
+ECR = Stores Images
+
+ECS = Runs and Manages Containers
+```
+
+---
+
+## Q2. What is Fargate?
+
+**Answer:**
+
+Fargate is a serverless compute option for running containers. It allows us to run ECS tasks without directly managing EC2 instances.
+
+---
+
+## Q3. What is an ECS Task Definition?
+
+**Answer:**
+
+A task definition is a blueprint that describes how a container should run, including the Docker image, CPU, memory, ports, environment variables, logging, and IAM configuration.
+
+---
+
+## Q4. What is an ECS Service?
+
+**Answer:**
+
+An ECS service manages long-running tasks and maintains the desired number of task instances.
+
+---
+
+## Q5. What happens if an ECS task fails?
+
+**Answer:**
+
+If the task is managed by an ECS service, ECS attempts to maintain the configured desired count by starting replacement tasks, subject to the service and deployment configuration.
+
+---
+
+## Q6. How does ECS deploy a new application version?
+
+**Answer:**
+
+A new container image is pushed to ECR, a new task definition revision referencing the image is registered, and the ECS service is updated to use that revision.
+
+---
+
+## Q7. Why did you use Git SHA tags?
+
+**Answer:**
+
+Git SHA tags provide an immutable link between the source code commit and the deployed container image. This improves traceability and rollback.
+
+---
+
+## Q8. What is the role of the ALB?
+
+**Answer:**
+
+The ALB receives external HTTP traffic and routes it through target groups to healthy application targets.
+
+---
+
+## Q9. What is the difference between an ECS task being RUNNING and an application being healthy?
+
+**Answer:**
+
+RUNNING means the ECS task/container is active. Application health requires additional verification, such as a successful health endpoint and healthy load balancer target status.
+
+---
+
+## Q10. What is Service Connect?
+
+**Answer:**
+
+Service Connect helps ECS services communicate internally using service-based connectivity rather than relying on changing task IP addresses.
+
+---
+
+## Q11. How do you troubleshoot a failed deployment?
+
+**Answer:**
+
+I investigate layer by layer:
+
+```text
+Image
+  |
+  v
+ECS Task
+  |
+  v
+Application Logs
+  |
+  v
+Health Checks
+  |
+  v
+Networking
+  |
+  v
+Dependencies
+```
+
+I check the task status, CloudWatch logs, target health, security groups, DNS/service connectivity, and downstream dependencies.
+
+---
+
+## Q12. How do you roll back an ECS deployment?
+
+**Answer:**
+
+I identify a previously known-good image version, verify it exists in ECR, deploy it through the controlled deployment process, and verify the ECS service and application health.
+
+---
+
+# 14.49 Key Takeaways
+
+The CitiCore AWS deployment architecture follows this core path:
+
+```text
+Spring Boot
+     |
+     v
+Maven
+     |
+     v
+JAR
+     |
+     v
+Docker Image
+     |
+     v
+Amazon ECR
+     |
+     v
+ECS Task Definition
+     |
+     v
+ECS Service
+     |
+     v
+AWS Fargate
+```
+
+External traffic:
+
+```text
+Client
+   |
+   v
+ALB
+   |
+   v
+Target Group
+   |
+   v
+Fargate Task
+```
+
+Internal service connectivity:
+
+```text
+Service
+   |
+   v
+Service Connect
+   |
+   v
+Service
+```
+
+Application-level discovery:
+
+```text
+Microservice
+   |
+   v
+Eureka
+```
+
+Deployment traceability:
+
+```text
+Git Commit
+    |
+    v
+Git SHA
+    |
+    v
+Docker Image
+    |
+    v
+ECR
+    |
+    v
+Task Definition Revision
+    |
+    v
+ECS Service
+```
+
+The most important practical lessons are:
+
+* Package services as immutable Docker images.
+* Store deployment images in ECR.
+* Use ECS task definitions as container runtime blueprints.
+* Use ECS services to manage long-running tasks.
+* Use Fargate to run containers without managing servers.
+* Use ALB and target groups for external traffic.
+* Treat task status, target health, and business correctness as separate checks.
+* Use Service Connect for internal ECS connectivity.
+* Avoid hardcoding Fargate task IP addresses.
+* Use immutable image tags for traceability and rollback.
+* Verify deployments across infrastructure and application layers.
+
+---
+
+# 14.50 Final Deployment Architecture Summary
+
+```text
+                   CITICORE AWS DEPLOYMENT
+
+Developer / Jenkins
+        |
+        v
+   Maven Build
+        |
+        v
+   Spring Boot JAR
+        |
+        v
+   Docker Build
+        |
+        v
+Docker Image (Git SHA)
+        |
+        v
+     Amazon ECR
+        |
+        v
+ ECS Task Definition
+        |
+        v
+    ECS Service
+        |
+        v
+   AWS Fargate
+        |
+        v
+ Spring Boot Container
+        |
+        +-------------------------+
+        |                         |
+        v                         v
+      ALB                  Service Connect
+        |                         |
+        v                         v
+External Clients          Internal Services
+        |
+        v
+   Target Group
+        |
+        v
+   Health Checks
+```
+
+> **In CitiCore, AWS container deployment provides the bridge between locally containerized Spring Boot microservices and a managed cloud runtime using ECR, ECS, Fargate, ALB, Service Connect, IAM, and CloudWatch.**
+
+---
+
+---
+## TOPIC 15. Jenkins CI/CD
+
+## 15.1 What Is CI/CD?
+
+## Concept
+
+**CI/CD** stands for:
+
+* **CI — Continuous Integration**
+* **CD — Continuous Delivery or Continuous Deployment**
+
+Continuous Integration means automatically building and validating code changes when they are integrated into the project.
+
+Continuous Delivery/Deployment extends this process by automating the delivery of the application to an environment.
+
+For CitiCore, the CI/CD flow connects the complete deployment lifecycle:
+
+```text
+Developer
+    |
+    v
+Git Push
+    |
+    v
+Jenkins Pipeline
+    |
+    +--> Checkout Code
+    |
+    +--> Build
+    |
+    +--> Test
+    |
+    +--> Docker Build
+    |
+    +--> Push to ECR
+    |
+    +--> Update ECS
+    |
+    +--> Verify Deployment
+```
+
+The main purpose is to reduce manual deployment work and make deployments more consistent and traceable.
+
+---
+
+# 15.2 Why Do We Need CI/CD?
+
+Without CI/CD, deployment can become a manual process.
+
+For example:
+
+```text
+Developer Changes Code
+        |
+        v
+Manual Build
+        |
+        v
+Manual Docker Build
+        |
+        v
+Manual Image Push
+        |
+        v
+Manual ECS Update
+```
+
+This introduces risks such as:
+
+* Forgetting a deployment step
+* Deploying the wrong image
+* Human configuration mistakes
+* Inconsistent deployments
+* Difficulty tracking versions
+* Slow release processes
+
+With CI/CD:
+
+```text
+Code Change
+    |
+    v
+Automated Pipeline
+    |
+    v
+Consistent Deployment Steps
+```
+
+The pipeline acts as a repeatable deployment process.
+
+---
+
+# 15.3 CitiCore Context
+
+## CitiCore Implementation
+
+For CitiCore, Jenkins is used to automate the build and deployment workflow for containerized Spring Boot microservices.
+
+The overall pipeline is:
+
+```text
+Git Repository
+      |
+      v
+Jenkins
+      |
+      +--> Checkout
+      |
+      +--> Maven Build
+      |
+      +--> Tests
+      |
+      +--> Docker Build
+      |
+      +--> Tag Image
+      |
+      +--> Push to Amazon ECR
+      |
+      +--> Register ECS Task Definition
+      |
+      +--> Update ECS Service
+      |
+      +--> Verify Deployment
+```
+
+The pipeline uses the Git commit SHA as part of the Docker image versioning strategy.
+
+Conceptually:
+
+```text
+Git Commit
+    |
+    v
+Commit SHA
+    |
+    v
+Docker Image Tag
+    |
+    v
+Amazon ECR
+    |
+    v
+ECS Deployment
+```
+
+This makes it possible to trace a deployed application image back to a specific source code version.
+
+---
+
+# 15.4 Jenkins Architecture
+
+## Concept
+
+Jenkins uses a controller-agent architecture.
+
+```text
+                    Jenkins Controller
+                           |
+              +------------+------------+
+              |                         |
+              v                         v
+       Jenkins Agent A           Jenkins Agent B
+```
+
+The controller manages:
+
+* Jobs
+* Pipelines
+* Build scheduling
+* Configuration
+* Pipeline orchestration
+
+Agents perform build work.
+
+For example:
+
+```text
+Jenkins Controller
+        |
+        v
+Java / Maven Agent
+        |
+        +--> Compile
+        |
+        +--> Test
+        |
+        +--> Package
+```
+
+Another agent may perform container-related work.
+
+```text
+Jenkins Controller
+        |
+        v
+Docker Agent
+        |
+        +--> Build Image
+        |
+        +--> Push Image
+```
+
+---
+
+# 15.5 CitiCore Jenkins Setup
+
+## CitiCore Implementation
+
+During the CitiCore learning and deployment work, Jenkins pipelines were moved toward using Jenkins agents for build execution.
+
+The project setup included:
+
+* Jenkins controller
+* Build agents
+* Java
+* Maven
+* Git
+* Docker
+* AWS CLI
+* AWS credentials
+* Amazon ECR access
+* Amazon ECS access
+
+The general architecture is:
+
+```text
+                    Jenkins Controller
+                           |
+                           v
+                    Jenkins Agent
+                           |
+          +----------------+----------------+
+          |                |                |
+          v                v                v
+         Git             Maven            Docker
+                                              |
+                                              v
+                                           AWS CLI
+                                              |
+                                  +-----------+-----------+
+                                  |                       |
+                                  v                       v
+                                 ECR                     ECS
+```
+
+The important concept is that Jenkins orchestrates the workflow while agents perform the actual pipeline work.
+
+---
+
+# 15.6 Jenkins Controller
+
+The Jenkins controller is responsible for coordinating the CI/CD process.
+
+Its responsibilities include:
+
+* Managing pipeline definitions
+* Scheduling builds
+* Assigning work to agents
+* Maintaining job configuration
+* Storing build history
+* Displaying pipeline results
+
+Conceptually:
+
+```text
+Developer Push
+      |
+      v
+Jenkins Controller
+      |
+      +--> Select Pipeline
+      |
+      +--> Allocate Agent
+      |
+      +--> Monitor Execution
+      |
+      +--> Store Build Result
+```
+
+The controller should not unnecessarily perform all heavy build operations in larger production environments.
+
+Instead:
+
+```text
+Controller
+    |
+    v
+Agent
+    |
+    v
+Build Work
+```
+
+This improves scalability and separation of responsibilities.
+
+---
+
+# 15.7 Jenkins Agent
+
+A Jenkins agent is a machine or runtime environment that executes pipeline steps.
+
+For CitiCore, an agent requires the tools needed by the pipeline.
+
+For example:
+
+```text
+Jenkins Agent
+     |
+     +--> Java
+     |
+     +--> Maven
+     |
+     +--> Git
+     |
+     +--> Docker
+     |
+     +--> AWS CLI
+```
+
+If a pipeline stage requires Docker but Docker is unavailable on the agent:
+
+```text
+Pipeline
+   |
+   v
+Docker Build
+   |
+   X
+Docker Not Available
+```
+
+Therefore, Jenkins agent configuration is an important part of CI/CD reliability.
+
+---
+
+# 15.8 Why Use Jenkins Agents?
+
+Agents provide several benefits.
+
+## Workload Separation
+
+```text
+Controller
+    |
+    v
+Pipeline Coordination
+```
+
+```text
+Agent
+    |
+    v
+Build Execution
+```
+
+## Tool Isolation
+
+Different agents can contain different tools.
+
+For example:
+
+```text
+Java Agent
+    |
+    +--> Java
+    +--> Maven
+```
+
+```text
+Docker Agent
+    |
+    +--> Docker
+    +--> AWS CLI
+```
+
+## Scalability
+
+Multiple builds can potentially run on multiple agents.
+
+```text
+                Jenkins Controller
+                       |
+          +------------+------------+
+          |                         |
+          v                         v
+       Agent 1                  Agent 2
+       Build A                  Build B
+```
+
+---
+
+# 15.9 Jenkins Pipeline
+
+## Concept
+
+A Jenkins Pipeline defines the stages required to build, test, and deploy an application.
+
+A simplified CitiCore pipeline looks like:
+
+```text
+Checkout
+    |
+    v
+Build
+    |
+    v
+Test
+    |
+    v
+Docker Build
+    |
+    v
+ECR Push
+    |
+    v
+ECS Deployment
+    |
+    v
+Verification
+```
+
+The pipeline should be defined as code whenever possible.
+
+This is commonly stored in a:
+
+```text
+Jenkinsfile
+```
+
+The main advantage is that the deployment workflow becomes version-controlled along with the application.
+
+---
+
+# 15.10 Pipeline as Code
+
+Without Pipeline as Code:
+
+```text
+Jenkins UI
+   |
+   v
+Manual Pipeline Configuration
+```
+
+The configuration may be difficult to track historically.
+
+With a Jenkinsfile:
+
+```text
+Git Repository
+      |
+      +--> Application Code
+      |
+      +--> Jenkinsfile
+```
+
+The pipeline can evolve with the application.
+
+Benefits include:
+
+* Version control
+* Code review
+* Reproducibility
+* Easier migration
+* Clear deployment documentation
+
+---
+
+# 15.11 CitiCore Pipeline Stages
+
+The logical CitiCore pipeline consists of the following stages.
+
+```text
+1. Checkout
+       |
+       v
+2. Build
+       |
+       v
+3. Test
+       |
+       v
+4. Docker Build
+       |
+       v
+5. Tag Image
+       |
+       v
+6. Push to ECR
+       |
+       v
+7. Register Task Definition
+       |
+       v
+8. Update ECS Service
+       |
+       v
+9. Verify Deployment
+```
+
+Each stage has a specific responsibility.
+
+---
+
+# 15.12 Stage 1 — Git Checkout
+
+The pipeline starts by retrieving the source code.
+
+```text
+Git Repository
+       |
+       v
+Jenkins Agent
+       |
+       v
+Workspace
+```
+
+The Jenkins workspace contains the code used for the current build.
+
+For example:
+
+```text
+Jenkins Workspace
+      |
+      +--> pom.xml
+      |
+      +--> src/
+      |
+      +--> Dockerfile
+      |
+      +--> Jenkinsfile
+```
+
+The workspace should not be confused with the final Docker image.
+
+The workspace is the build environment where Jenkins performs the pipeline operations.
+
+---
+
+# 15.13 Jenkins Workspace
+
+## What Is It?
+
+A Jenkins workspace is the directory where Jenkins checks out and builds the project.
+
+Conceptually:
+
+```text
+Jenkins Agent
+      |
+      v
+Workspace
+      |
+      +--> Source Code
+      |
+      +--> Build Output
+      |
+      +--> Temporary Files
+```
+
+For CitiCore, the Maven build and Docker build are executed using the application source available in the workspace.
+
+---
+
+# 15.14 Stage 2 — Maven Build
+
+The Spring Boot application must be compiled and packaged.
+
+The typical flow is:
+
+```text
+Java Source Code
+       |
+       v
+Maven
+       |
+       +--> Compile
+       |
+       +--> Test
+       |
+       +--> Package
+       |
+       v
+Application JAR
+```
+
+A typical command is:
+
+```bash
+mvn clean package
+```
+
+Depending on the pipeline structure, tests may be executed as part of this command or in a separate stage.
+
+The important output is the packaged application artifact.
+
+---
+
+# 15.15 Stage 3 — Testing
+
+Testing should validate the application before deployment.
+
+Conceptually:
+
+```text
+Source Code
+    |
+    v
+Build
+    |
+    v
+Tests
+    |
+    +--> Pass
+    |      |
+    |      v
+    |   Continue
+    |
+    +--> Fail
+           |
+           v
+      Stop Pipeline
+```
+
+The basic principle is:
+
+> Do not deploy an application that has failed the pipeline's required validation stages.
+
+For a production-grade pipeline, testing may include:
+
+* Unit tests
+* Integration tests
+* Static analysis
+* Security scanning
+
+The exact set of tests depends on the project's implementation.
+
+---
+
+# 15.16 CitiCore Testing Context
+
+The documented CitiCore pipeline focused primarily on the build and deployment lifecycle.
+
+The project notes contain Maven build and deployment automation work.
+
+Where additional automated quality gates are introduced, they should be clearly distinguished from the currently implemented pipeline.
+
+For example:
+
+```text
+Current Pipeline
+    |
+    +--> Build
+    |
+    +--> Test
+    |
+    +--> Docker
+    |
+    +--> Deploy
+```
+
+A future improvement could include:
+
+```text
+Future Pipeline
+    |
+    +--> SonarQube
+    |
+    +--> Security Scan
+    |
+    +--> Integration Test Environment
+```
+
+These should not be presented as already implemented unless supported by the CitiCore implementation notes.
+
+---
+
+# 15.17 Stage 4 — Docker Build
+
+After the application is packaged, Jenkins builds a Docker image.
+
+```text
+Spring Boot JAR
+       |
+       v
+Dockerfile
+       |
+       v
+Docker Build
+       |
+       v
+Container Image
+```
+
+Conceptually:
+
+```bash
+docker build -t account-service .
+```
+
+In CI/CD, the image name should include version information.
+
+For CitiCore, Git SHA-based tagging is used.
+
+---
+
+# 15.18 Docker Image Tagging
+
+The pipeline retrieves the Git commit identifier.
+
+```text
+Git Repository
+       |
+       v
+Current Commit
+       |
+       v
+Commit SHA
+```
+
+The SHA is used as an image tag.
+
+Example:
+
+```text
+account-service:434a66e
+```
+
+This is better for traceability than:
+
+```text
+account-service:latest
+```
+
+because the image can be connected to a specific code version.
+
+The complete relationship is:
+
+```text
+Git Commit
+      |
+      v
+Git SHA
+      |
+      v
+Docker Image Tag
+      |
+      v
+ECR Image
+      |
+      v
+ECS Deployment
+```
+
+---
+
+# 15.19 Why Git SHA Is Useful
+
+Suppose a deployment causes a problem.
+
+```text
+Image
+   |
+   v
+account-service:434a66e
+```
+
+The team can identify:
+
+```text
+434a66e
+   |
+   v
+Exact Git Commit
+```
+
+This helps answer:
+
+* Which code version was deployed?
+* What changed?
+* Which version was stable?
+* Which image should be rolled back to?
+
+This improves deployment traceability.
+
+---
+
+# 15.20 Stage 5 — Authenticate With Amazon ECR
+
+Before Jenkins can push the Docker image, Docker must authenticate with Amazon ECR.
+
+The logical flow is:
+
+```text
+Jenkins
+   |
+   v
+AWS CLI
+   |
+   v
+ECR Authentication Token
+   |
+   v
+Docker Login
+   |
+   v
+Authorized ECR Push
+```
+
+The AWS credentials should be provided securely.
+
+They should not be hardcoded in:
+
+```text
+Jenkinsfile
+```
+
+or:
+
+```text
+Application Source Code
+```
+
+---
+
+# 15.21 Stage 6 — Push Image to ECR
+
+After building and tagging the image:
+
+```text
+Docker Image
+     |
+     v
+Amazon ECR
+```
+
+The pipeline flow is:
+
+```text
+Docker Build
+      |
+      v
+Tag Image
+      |
+      v
+Docker Push
+      |
+      v
+Amazon ECR Repository
+```
+
+Once the image is available in ECR, ECS can retrieve it when starting a task.
+
+---
+
+# 15.22 ECR Deployment Flow
+
+```text
+Jenkins
+   |
+   v
+Build Docker Image
+   |
+   v
+Tag With Git SHA
+   |
+   v
+Authenticate to ECR
+   |
+   v
+Push Image
+   |
+   v
+ECR Repository
+```
+
+Then:
+
+```text
+ECS Task Definition
+        |
+        v
+Pulls Image
+        |
+        v
+Fargate Task
+```
+
+---
+
+# 15.23 Stage 7 — ECS Task Definition Update
+
+The ECS task definition must reference the new container image.
+
+Conceptually:
+
+```text
+Old Task Definition
+       |
+       v
+Old Image Tag
+```
+
+A new deployment requires:
+
+```text
+New Task Definition Revision
+       |
+       v
+New Image Tag
+```
+
+The pipeline can create a new revision using the updated image information.
+
+```text
+New ECR Image
+      |
+      v
+Task Definition Revision
+      |
+      v
+ECS Service Update
+```
+
+---
+
+# 15.24 Task Definition Revisioning
+
+ECS task definitions are revisioned.
+
+```text
+account-service
+       |
+       +--> Revision 1
+       |
+       +--> Revision 2
+       |
+       +--> Revision 3
+       |
+       +--> Revision N
+```
+
+Each revision can contain updated configuration or a different image.
+
+This supports deployment history and controlled rollback.
+
+---
+
+# 15.25 Stage 8 — Update ECS Service
+
+After registering the new task definition revision, Jenkins updates the ECS service.
+
+```text
+New Task Definition
+        |
+        v
+Update ECS Service
+        |
+        v
+ECS Deployment Starts
+```
+
+The ECS service then manages the rollout.
+
+Conceptually:
+
+```text
+Old Task
+    |
+    v
+New Task Starts
+    |
+    v
+Health Check
+    |
+    v
+New Task Receives Traffic
+    |
+    v
+Old Task Stops
+```
+
+The exact rollout behavior depends on ECS deployment configuration.
+
+---
+
+# 15.26 Important Jenkins Deployment Principle
+
+A successful ECS update command does not necessarily mean the application is fully deployed and healthy.
+
+For example:
+
+```text
+Jenkins
+   |
+   v
+Update ECS Service
+   |
+   v
+AWS Accepts Request
+```
+
+At this point:
+
+```text
+Deployment Started
+```
+
+But ECS still needs to:
+
+```text
+Start Task
+    |
+    v
+Pull Image
+    |
+    v
+Start Application
+    |
+    v
+Pass Health Checks
+    |
+    v
+Become Stable
+```
+
+Therefore, deployment verification is important.
+
+---
+
+# 15.27 Stage 9 — Deployment Verification
+
+A successful pipeline should verify multiple states.
+
+```text
+ECS Service
+     |
+     v
+Desired Task Definition
+```
+
+```text
+ECS Tasks
+     |
+     v
+Expected Running State
+```
+
+```text
+Target Group
+     |
+     v
+Healthy Targets
+```
+
+```text
+Application
+     |
+     v
+Health Endpoint
+```
+
+The complete verification flow is:
+
+```text
+Pipeline Deployment
+       |
+       v
+ECS Service Updated
+       |
+       v
+New Task Started
+       |
+       v
+Task Running
+       |
+       v
+Application Started
+       |
+       v
+Health Check
+       |
+       v
+Target Healthy
+```
+
+---
+
+# 15.28 Health Verification
+
+For Spring Boot services, a health endpoint can be used.
+
+Conceptually:
+
+```text
+Jenkins
+   |
+   v
+Application Health Endpoint
+   |
+   v
+HTTP Response
+```
+
+A successful deployment should verify more than:
+
+```text
+Task = RUNNING
+```
+
+The application should also be:
+
+```text
+Application = HEALTHY
+```
+
+These are different states.
+
+---
+
+# 15.29 Deployment Verification vs Business Verification
+
+This is an important distinction.
+
+Infrastructure verification:
+
+```text
+ECS Task Running
+```
+
+Application verification:
+
+```text
+Health Endpoint Responding
+```
+
+Business verification:
+
+```text
+Business API Working Correctly
+```
+
+The complete confidence chain is:
+
+```text
+Container Running
+        |
+        v
+Application Healthy
+        |
+        v
+Dependencies Available
+        |
+        v
+Business Function Working
+```
+
+A deployment can succeed at one level while still failing at another.
+
+---
+
+# 15.30 Rollback
+
+## Concept
+
+Rollback means returning the service to a previously known stable version.
+
+The basic flow is:
+
+```text
+New Deployment
+      |
+      v
+Problem Detected
+      |
+      v
+Identify Previous Stable Version
+      |
+      v
+Deploy Previous Image
+      |
+      v
+Verify Service
+```
+
+---
+
+# 15.31 CitiCore Rollback Approach
+
+The CitiCore deployment notes describe a controlled rollback approach.
+
+The general process is:
+
+```text
+Deployment Problem
+       |
+       v
+Identify Stable Git SHA
+       |
+       v
+Verify Image Exists in ECR
+       |
+       v
+Select Previous Version
+       |
+       v
+Deploy Through Jenkins
+       |
+       v
+Verify ECS Service
+       |
+       v
+Verify Application
+```
+
+Rollback should use a known image version rather than guessing which version was previously running.
+
+This is one reason immutable image tags are important.
+
+---
+
+# 15.32 Why Manual Rollback Can Be Useful
+
+CitiCore's documented rollback approach is deliberately controlled.
+
+Automatic rollback may be useful in some environments, but it can also hide the root cause or trigger repeated deployment behavior.
+
+A controlled rollback process allows:
+
+```text
+Failure
+   |
+   v
+Investigation
+   |
+   v
+Decision
+   |
+   v
+Rollback
+```
+
+This provides:
+
+* Human confirmation
+* Better incident analysis
+* Controlled recovery
+* Clear operational decisions
+
+---
+
+# 15.33 Complete CitiCore CI/CD Flow
+
+The complete pipeline can be visualized as:
+
+```text
+Developer
+    |
+    v
+Git Push
+    |
+    v
+Jenkins Trigger
+    |
+    v
+Checkout Source Code
+    |
+    v
+Maven Build
+    |
+    v
+Run Tests
+    |
+    v
+Create JAR
+    |
+    v
+Docker Build
+    |
+    v
+Get Git SHA
+    |
+    v
+Tag Docker Image
+    |
+    v
+Authenticate to ECR
+    |
+    v
+Push Image to ECR
+    |
+    v
+Create Task Definition Revision
+    |
+    v
+Update ECS Service
+    |
+    v
+ECS Rolling Deployment
+    |
+    v
+Health Verification
+    |
+    v
+Deployment Complete
+```
+
+---
+
+# 15.34 Example Pipeline Structure
+
+The exact Jenkinsfile should remain aligned with the project's actual implementation.
+
+A simplified structure is:
+
+```groovy
+pipeline {
+    agent any
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                // Retrieve source code
+            }
+        }
+
+        stage('Build') {
+            steps {
+                // Run Maven build
+            }
+        }
+
+        stage('Test') {
+            steps {
+                // Run application tests
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
+                // Build Docker image
+            }
+        }
+
+        stage('Push to ECR') {
+            steps {
+                // Authenticate and push image
+            }
+        }
+
+        stage('Deploy to ECS') {
+            steps {
+                // Register task definition
+                // Update ECS service
+            }
+        }
+
+        stage('Verify') {
+            steps {
+                // Verify deployment
+            }
+        }
+    }
+}
+```
+
+The purpose of this example is to show the pipeline structure rather than reproduce a large Jenkinsfile.
+
+---
+
+# 15.35 Important Jenkins Credentials
+
+The pipeline may require access to:
+
+* Git repository
+* AWS
+* Amazon ECR
+* Amazon ECS
+
+Credentials should be managed securely.
+
+Avoid:
+
+```text
+Jenkinsfile
+    |
+    +--> Hardcoded Password
+```
+
+Prefer:
+
+```text
+Jenkins Credentials
+        |
+        v
+Pipeline
+```
+
+The principle is:
+
+> Sensitive credentials should be stored in a secure credential management mechanism and injected only when required.
+
+---
+
+# 15.36 AWS Permissions for Jenkins
+
+Jenkins needs appropriate AWS permissions to perform deployment actions.
+
+Depending on the pipeline responsibilities, it may require access to:
+
+```text
+ECR
+ |
+ +--> Authenticate
+ |
+ +--> Push Image
+```
+
+and:
+
+```text
+ECS
+ |
+ +--> Register Task Definition
+ |
+ +--> Update Service
+ |
+ +--> Describe Deployment
+```
+
+The permissions should follow least privilege.
+
+```text
+Jenkins IAM Identity
+        |
+        v
+Only Required Permissions
+```
+
+Avoid giving unnecessary administrative access.
+
+---
+
+# 15.37 Failure Handling in the Pipeline
+
+A CI/CD pipeline should stop when a critical stage fails.
+
+For example:
+
+```text
+Build
+ |
+ X
+Failure
+ |
+ v
+Pipeline Stops
+```
+
+The deployment should not continue to:
+
+```text
+Docker Build
+```
+
+if the application did not build successfully.
+
+Similarly:
+
+```text
+Tests
+ |
+ X
+Failure
+ |
+ v
+Stop Pipeline
+```
+
+The pipeline stages create a validation sequence.
+
+```text
+Build
+   |
+   v
+Test
+   |
+   v
+Package
+   |
+   v
+Deploy
+```
+
+Each stage provides confidence before the next stage begins.
+
+---
+
+# 15.38 Failure Scenario: Docker Build Failure
+
+## Problem
+
+The application builds successfully, but the Docker image build fails.
+
+```text
+Maven Build
+    |
+    v
+Success
+    |
+    v
+Docker Build
+    |
+    X
+Failure
+```
+
+## Investigation
+
+Check:
+
+* Dockerfile
+* Build context
+* JAR path
+* Docker daemon availability
+* Agent permissions
+
+## Solution
+
+Ensure:
+
+```text
+Jenkins Workspace
+        |
+        +--> Dockerfile
+        |
+        +--> Required Application Artifact
+```
+
+The Docker build context must contain the required files.
+
+---
+
+# 15.39 Failure Scenario: Docker Unavailable on Jenkins Agent
+
+## Problem
+
+The pipeline reaches:
+
+```text
+Docker Build
+```
+
+but the agent cannot execute Docker.
+
+## Root Cause
+
+The Jenkins agent does not have:
+
+* Docker installed
+* Docker daemon access
+* Required permissions
+
+## Solution
+
+The agent must be configured with Docker access.
+
+```text
+Jenkins Agent
+       |
+       v
+Docker CLI
+       |
+       v
+Docker Runtime
+```
+
+This was one of the important practical areas encountered during Jenkins and Docker setup work.
+
+---
+
+# 15.40 Failure Scenario: ECR Push Failure
+
+## Problem
+
+The Docker image builds successfully but cannot be pushed to ECR.
+
+```text
+Docker Image
+     |
+     v
+ECR Push
+     |
+     X
+Access Denied / Authentication Failure
+```
+
+## Investigation
+
+Check:
+
+* AWS credentials
+* AWS region
+* ECR repository
+* IAM permissions
+* ECR login
+
+## Solution
+
+Ensure:
+
+```text
+Jenkins
+   |
+   v
+Valid AWS Credentials
+   |
+   v
+ECR Authentication
+   |
+   v
+Correct Repository
+```
+
+---
+
+# 15.41 Failure Scenario: ECS Deployment Starts but Application Fails
+
+## Problem
+
+Jenkins successfully updates ECS.
+
+```text
+Jenkins
+   |
+   v
+ECS Update = Success
+```
+
+But:
+
+```text
+Fargate Task
+   |
+   X
+Application Fails
+```
+
+## Investigation
+
+Check:
+
+* ECS stopped task reason
+* CloudWatch logs
+* Environment variables
+* Secrets
+* Database connectivity
+* Config Server
+* Eureka
+* Kafka
+* Redis
+
+## Important Lesson
+
+A successful deployment API call is not the same as a successful application deployment.
+
+---
+
+# 15.42 Failure Scenario: Task Running but ALB Target Unhealthy
+
+## Problem
+
+```text
+ECS Task = RUNNING
+```
+
+but:
+
+```text
+ALB Target = UNHEALTHY
+```
+
+## Possible Causes
+
+* Wrong health check path
+* Incorrect port
+* Application not fully started
+* Security group issue
+* Health endpoint unavailable
+
+## Investigation
+
+```text
+ALB Target Health
+       |
+       v
+Health Check Configuration
+       |
+       v
+Application Logs
+       |
+       v
+Application Endpoint
+```
+
+## Solution
+
+Ensure the health check configuration matches the actual running application.
+
+---
+
+# 15.43 Real Practical Lesson: Verify More Than One Layer
+
+One of the most important lessons from CitiCore deployment work is that distributed applications must be verified across multiple layers.
+
+```text
+Jenkins Pipeline
+      |
+      v
+ECS Service
+      |
+      v
+Fargate Task
+      |
+      v
+Application
+      |
+      v
+Load Balancer
+      |
+      v
+Business API
+```
+
+A problem at any layer can make the overall system appear unavailable.
+
+Therefore, troubleshooting should proceed layer by layer.
+
+---
+
+# 15.44 Jenkins and Git SHA Traceability
+
+The deployment chain is:
+
+```text
+Source Code
+     |
+     v
+Git Commit
+     |
+     v
+Commit SHA
+     |
+     v
+Docker Image
+     |
+     v
+ECR
+     |
+     v
+ECS Task Definition
+     |
+     v
+Running Application
+```
+
+This allows the deployed service to be traced back to its source version.
+
+This is particularly valuable when answering:
+
+> "Which version introduced the issue?"
+
+---
+
+# 15.45 Jenkins vs Manual Deployment
+
+## Manual Deployment
+
+```text
+Developer
+   |
+   +--> Build
+   |
+   +--> Docker
+   |
+   +--> Login
+   |
+   +--> Push
+   |
+   +--> ECS Update
+```
+
+Problems include:
+
+* Inconsistent steps
+* Human errors
+* Poor traceability
+* Slow deployments
+
+---
+
+## Jenkins Deployment
+
+```text
+Git
+ |
+ v
+Jenkins
+ |
+ +--> Build
+ |
+ +--> Test
+ |
+ +--> Docker
+ |
+ +--> ECR
+ |
+ +--> ECS
+ |
+ +--> Verify
+```
+
+Advantages include:
+
+* Repeatability
+* Automation
+* Consistency
+* Traceability
+* Faster deployment workflow
+
+---
+
+# 15.46 Trade-offs
+
+## Advantages of Jenkins
+
+### Flexible
+
+Jenkins supports:
+
+* Different agents
+* Custom pipelines
+* Many integrations
+
+### Pipeline as Code
+
+The deployment process can be version-controlled.
+
+### Extensible
+
+Plugins can integrate with different tools and platforms.
+
+---
+
+## Disadvantages
+
+### Infrastructure Management
+
+Jenkins itself requires maintenance.
+
+### Plugin Dependencies
+
+Plugin versions and compatibility can create operational complexity.
+
+### Agent Configuration
+
+Build agents must be configured correctly.
+
+### Security Management
+
+Credentials and access permissions require careful handling.
+
+---
+
+# 15.47 Alternatives
+
+Possible alternatives include:
+
+* GitHub Actions
+* GitLab CI/CD
+* AWS CodePipeline
+* AWS CodeBuild
+
+The choice depends on:
+
+* Existing infrastructure
+* Team expertise
+* AWS integration
+* Cost
+* Operational requirements
+
+For CitiCore, Jenkins was used as the CI/CD automation tool.
+
+---
+
+# 15.48 Production Considerations
+
+A production CI/CD system should consider additional controls.
+
+## Separate Environments
+
+```text
+Development
+     |
+     v
+Staging
+     |
+     v
+Production
+```
+
+Each environment should have appropriate configuration and deployment controls.
+
+---
+
+## Quality Gates
+
+Possible gates include:
+
+```text
+Build
+  |
+  v
+Unit Tests
+  |
+  v
+Integration Tests
+  |
+  v
+Static Analysis
+  |
+  v
+Security Scan
+  |
+  v
+Deployment
+```
+
+Not all of these should be claimed as current CitiCore implementation unless they are actually configured.
+
+---
+
+## Deployment Approval
+
+For sensitive production systems:
+
+```text
+Pipeline
+    |
+    v
+Approval
+    |
+    v
+Production Deployment
+```
+
+This can reduce accidental deployments.
+
+---
+
+## Auditability
+
+A deployment should ideally record:
+
+* Build number
+* Git commit
+* Image version
+* Deployment time
+* Target environment
+
+---
+
+# 15.49 How I Would Explain Jenkins CI/CD in an Interview
+
+> "In CitiCore, I used Jenkins to automate the CI/CD workflow for our containerized Spring Boot microservices. The pipeline checks out the source code, builds the application with Maven, runs the configured validation steps, creates a Docker image, and tags the image using the Git commit SHA for traceability. The image is pushed to Amazon ECR, and the pipeline updates the ECS task definition and service to deploy the new version on Fargate. After deployment, I verify the service at multiple levels, including ECS task status, health checks, logs, and application availability. For rollback, we can identify a previously stable Git SHA and redeploy the corresponding container image."
+
+---
+
+# 15.50 30–60 Second Interview Answer
+
+> "I implemented a Jenkins-based CI/CD flow for CitiCore microservices. Jenkins checks out the code, builds the Spring Boot application using Maven, creates a Docker image, and tags it with the Git SHA. The image is pushed to Amazon ECR, and Jenkins updates the ECS task definition and service to deploy the new version on Fargate. We use versioned images for traceability and controlled rollback. I also learned that a successful ECS update command does not mean the deployment is fully healthy, so verification needs to include ECS status, application health, logs, and load balancer target health."
+
+---
+
+# 15.51 Interview Follow-up Questions
+
+## Q1. What is the difference between Continuous Integration and Continuous Deployment?
+
+**Answer:**
+
+Continuous Integration focuses on automatically integrating, building, and validating code changes.
+
+Continuous Deployment automatically deploys validated changes to an environment.
+
+---
+
+## Q2. Why did you use Jenkins?
+
+**Answer:**
+
+Jenkins provides flexible pipeline automation and integrates with Git, Maven, Docker, AWS, and other tools required by the CitiCore deployment workflow.
+
+---
+
+## Q3. What is a Jenkins agent?
+
+**Answer:**
+
+A Jenkins agent executes build and pipeline tasks. It can contain the tools required for specific workloads, such as Java, Maven, Docker, and AWS CLI.
+
+---
+
+## Q4. Why should builds run on agents instead of the controller?
+
+**Answer:**
+
+Agents separate build workloads from the Jenkins controller, improve scalability, and allow different environments for different build requirements.
+
+---
+
+## Q5. Why did you use Git SHA as a Docker image tag?
+
+**Answer:**
+
+The Git SHA provides traceability between the source code commit and the deployed container image and makes rollback easier.
+
+---
+
+## Q6. What happens after Jenkins updates an ECS service?
+
+**Answer:**
+
+ECS begins the deployment process. It starts tasks using the new task definition and image, performs the configured deployment and health processes, and eventually transitions the service to the new version according to its deployment configuration.
+
+---
+
+## Q7. How do you handle a failed deployment?
+
+**Answer:**
+
+I investigate the failed layer using Jenkins logs, ECS task events, CloudWatch logs, health checks, and dependency connectivity. If necessary, I identify a known-good image version and perform a controlled rollback.
+
+---
+
+## Q8. How do you secure AWS credentials in Jenkins?
+
+**Answer:**
+
+Credentials should be stored in Jenkins credential management or another secure mechanism rather than being hardcoded in the Jenkinsfile or source code.
+
+---
+
+## Q9. What is the Jenkins workspace?
+
+**Answer:**
+
+The workspace is the directory on the Jenkins agent where source code is checked out and build operations are performed.
+
+---
+
+## Q10. How do you verify that a deployment was successful?
+
+**Answer:**
+
+I verify multiple layers:
+
+```text
+Pipeline Success
+      |
+      v
+ECS Service Updated
+      |
+      v
+Task Running
+      |
+      v
+Application Healthy
+      |
+      v
+Target Healthy
+      |
+      v
+API Working
+```
+
+---
+
+# 15.52 Key Takeaways
+
+The CitiCore CI/CD architecture follows this path:
+
+```text
+Developer
+    |
+    v
+Git Repository
+    |
+    v
+Jenkins
+    |
+    v
+Checkout
+    |
+    v
+Maven Build
+    |
+    v
+Test
+    |
+    v
+Docker Build
+    |
+    v
+Git SHA Tag
+    |
+    v
+Amazon ECR
+    |
+    v
+ECS Task Definition
+    |
+    v
+ECS Service
+    |
+    v
+AWS Fargate
+    |
+    v
+Deployment Verification
+```
+
+The most important lessons are:
+
+* Automate repeatable deployment tasks.
+* Keep the pipeline as code where possible.
+* Use Jenkins agents for build execution.
+* Use Git SHA-based image tags for traceability.
+* Push immutable application images to ECR.
+* Deploy using ECS task definition revisions.
+* Verify deployment at multiple layers.
+* Treat task status and application health as different states.
+* Investigate failures layer by layer.
+* Use controlled rollback with known-good versions.
+* Secure Jenkins and AWS credentials.
+* Avoid claiming a deployment is successful before the service becomes operationally healthy.
+
+---
+
+# 15.53 Final CI/CD Architecture Summary
+
+```text
+                    CITICORE CI/CD PIPELINE
+
+Developer
+    |
+    v
+Git Push
+    |
+    v
++----------------------+
+|      JENKINS         |
+|                      |
+|  Checkout            |
+|      |               |
+|      v               |
+|  Maven Build         |
+|      |               |
+|      v               |
+|  Tests               |
+|      |               |
+|      v               |
+|  Docker Build        |
+|      |               |
+|      v               |
+|  Git SHA Tag         |
++------+---------------+
+       |
+       v
++----------------------+
+|     AMAZON ECR       |
+|                      |
+| Container Image      |
++----------+-----------+
+           |
+           v
++----------------------+
+|       AWS ECS        |
+|                      |
+| Task Definition      |
+|       |              |
+|       v              |
+| ECS Service          |
++----------+-----------+
+           |
+           v
++----------------------+
+|    AWS FARGATE       |
+|                      |
+| Spring Boot Service  |
++----------+-----------+
+           |
+           v
++----------------------+
+|    VERIFICATION      |
+|                      |
+| ECS Task             |
+| Health Endpoint      |
+| Target Health        |
+| Application Logs     |
++----------------------+
+```
+
+> **CitiCore uses Jenkins to automate the journey from source code to a versioned Docker image and finally to a managed ECS/Fargate deployment, with traceability, verification, and controlled rollback as important parts of the delivery process.**
+
+---
